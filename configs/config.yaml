@@ -1,0 +1,75 @@
+seed: 42
+
+paths:
+  raw_data_dir: "data/raw"
+  raw_data_file: "edge_iiotset.csv"
+  processed_data_dir: "data/processed"
+  processed_data_file: "edge_iiotset_processed.csv"
+  artifacts_dir: "outputs/artifacts"
+  models_dir: "outputs/models"
+  results_dir: "outputs/results"
+  shap_plots_dir: "outputs/shap_plots"
+  logs_dir: "logs"
+
+dataset:
+  name: "Edge-IIoTset"
+  target_column: "Attack_type"          # native raw-CSV column (multi-class)
+  raw_binary_column: "Attack_label"     # native raw-CSV column (binary) — removed exclusively by create_labels
+  derived_label_column: "label"         # created by create_labels from target_column
+  derived_binary_column: "binary_label" # created by create_labels from raw_binary_column
+  normal_class_value: "Normal"          # exact string match used to derive binary_label == 0
+  test_size: 0.2
+  drop_columns:
+    - "ip.src_host"
+    - "ip.dst_host"
+    - "arp.src.proto_ipv4"
+    - "arp.dst.proto_ipv4"
+    - "http.file_data"
+    - "http.request.full_uri"
+    - "tcp.options"
+    - "tcp.payload"
+    - "dns.qry.name.len"
+    - "mqtt.msg"
+  categorical_column_rule: "dtype_object"   # the only implemented rule (Section 14.2); passed explicitly into
+                                             # infer_feature_column_types so the config key is never unused
+  force_reprocess: false
+
+model:
+  conv_filters: 64
+  conv_kernel_size: 3
+  conv_padding: "same"
+  conv_activation: "relu"
+  pool_size: 2
+  gru_units: 64
+  gru_return_sequences: false
+  dropout_rate: 0.3
+  dense_units: 128
+  dense_activation: "relu"
+  output_activation: "softmax"
+
+training:
+  optimizer: "adam"   # documentation-only; Adam is the only implemented optimizer (Section 6)
+  learning_rate: 0.001
+  loss: "categorical_crossentropy"
+  batch_size: 64
+  centralized_epochs: 10
+  validation_split: 0.2
+  early_stopping_patience: 3
+  early_stopping_monitor: "val_loss"
+
+federated:
+  num_clients: 4
+  num_rounds: 15
+  local_epochs: 2
+  partition_strategy: "iid"
+  min_available_clients: 4
+  min_fit_clients: 4
+  min_evaluate_clients: 4
+
+explainability:
+  method: "GradientExplainer"
+  sample_size: 100
+  background_size: 100
+
+dashboard:
+  title: "IIoT Federated Intrusion Detection Dashboard"
