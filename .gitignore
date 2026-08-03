@@ -24,3 +24,9 @@ outputs/
 
 # Processed data
 data/processed/
+# Datasets
+data/raw/
+data/processed/
+
+# Generated outputs
+outputs/
