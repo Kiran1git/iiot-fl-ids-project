@@ -1,11 +1,6 @@
-"""Unit tests for src/preprocessing/load_dataset.py — Phase 3.
+"""Unit tests for src/preprocessing/ — Phases 3 and 4.
 
-Covers the load/drop/label cases mandated by SDS Section 19 and the Phase 3
-validation checklist. Phase 4 cases (infer_feature_column_types,
-split_train_test, prepare_model_ready_data, leakage regression) are added in
-Phase 4 by extending this file.
-
-SDS Section 19 required cases (Phase 3 scope):
+Phase 3 cases (load_dataset.py):
   - load_raw_dataset raises FileNotFoundError on bad path.
   - drop_identifier_columns removes only configured identifier columns,
     ignores missing ones without error, and never removes Attack_type /
@@ -13,6 +8,17 @@ SDS Section 19 required cases (Phase 3 scope):
   - create_labels produces both label and binary_label with no NaNs,
     and both Attack_type and Attack_label are absent from the returned
     DataFrame.
+
+Phase 4 cases (encode_normalize.py — SDS Section 19):
+  - infer_feature_column_types correctly separates a mixed dummy DataFrame
+    into categorical/numeric lists using rule="dtype_object", excludes
+    label/binary_label from both, and raises ValueError for any other rule.
+  - split_train_test produces non-overlapping index sets whose union covers
+    the full dataset.
+  - prepare_model_ready_data produces X of shape (n, num_features, 1) and
+    one-hot y of shape (n, num_classes) for a small dummy processed DataFrame.
+  - Leakage regression: encoders/scaler fit only on a training slice produce
+    different parameters than if fit on the full dataset.
 """
 
 import logging
@@ -21,10 +27,20 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from sklearn.preprocessing import LabelEncoder
+
 from src.preprocessing.load_dataset import (
     create_labels,
     drop_identifier_columns,
     load_raw_dataset,
+)
+from src.preprocessing.encode_normalize import (
+    fit_categorical_encoder,
+    fit_label_encoder,
+    fit_scaler,
+    infer_feature_column_types,
+    prepare_model_ready_data,
+    split_train_test,
 )
 
 
@@ -319,3 +335,338 @@ class TestCreateLabels:
         )
         assert "label" in result.columns
         assert "binary_label" in result.columns
+
+
+# ===========================================================================
+# Phase 4 test cases — encode_normalize.py (SDS Section 19)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Shared fixture for Phase 4 tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def labeled_df() -> pd.DataFrame:
+    """Synthetic post-create_labels DataFrame for Phase 4 tests.
+
+    Mimics the state of the DataFrame after Phase 3 functions have run:
+    - Attack_type and Attack_label are absent.
+    - label and binary_label are present.
+    - One categorical column (proto) and two numeric columns (frame.len, port).
+    - 30 rows (10 per class) so a stratified 80/20 split yields 6 test rows,
+      which satisfies sklearn's requirement of >= num_classes (3) in test set.
+    """
+    n_per_class = 10
+    protos = (["tcp", "udp"] * 15)[:n_per_class * 3]
+    frame_lens = list(range(60, 60 + n_per_class * 3))
+    ports = [80, 443, 8080] * n_per_class
+    labels = (
+        ["Normal"] * n_per_class
+        + ["DDoS_HTTP"] * n_per_class
+        + ["MITM"] * n_per_class
+    )
+    binary_labels = [0] * n_per_class + [1] * (n_per_class * 2)
+    return pd.DataFrame(
+        {
+            "proto": protos,
+            "frame.len": frame_lens,
+            "port": ports,
+            "label": labels,
+            "binary_label": binary_labels,
+        }
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# infer_feature_column_types — SDS Section 14.2
+# ---------------------------------------------------------------------------
+
+class TestInferFeatureColumnTypes:
+    """Tests for infer_feature_column_types."""
+
+    def test_returns_two_lists(self, labeled_df):
+        """infer_feature_column_types returns a tuple of two lists."""
+        result = infer_feature_column_types(labeled_df)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        cat_cols, num_cols = result
+        assert isinstance(cat_cols, list)
+        assert isinstance(num_cols, list)
+
+    def test_categorical_column_identified(self, labeled_df):
+        """Object-dtype column 'proto' is classified as categorical."""
+        cat_cols, _ = infer_feature_column_types(labeled_df)
+        assert "proto" in cat_cols
+
+    def test_numeric_columns_identified(self, labeled_df):
+        """Numeric columns 'frame.len' and 'port' are classified as numeric."""
+        _, num_cols = infer_feature_column_types(labeled_df)
+        assert "frame.len" in num_cols
+        assert "port" in num_cols
+
+    def test_label_excluded_from_both_lists(self, labeled_df):
+        """'label' is excluded from both categorical and numeric output lists."""
+        cat_cols, num_cols = infer_feature_column_types(labeled_df)
+        assert "label" not in cat_cols
+        assert "label" not in num_cols
+
+    def test_binary_label_excluded_from_both_lists(self, labeled_df):
+        """'binary_label' is excluded from both output lists."""
+        cat_cols, num_cols = infer_feature_column_types(labeled_df)
+        assert "binary_label" not in cat_cols
+        assert "binary_label" not in num_cols
+
+    def test_lists_are_disjoint(self, labeled_df):
+        """Categorical and numeric lists share no column names."""
+        cat_cols, num_cols = infer_feature_column_types(labeled_df)
+        assert len(set(cat_cols) & set(num_cols)) == 0
+
+    def test_union_covers_all_feature_columns(self, labeled_df):
+        """Union of both lists covers every non-label feature column."""
+        cat_cols, num_cols = infer_feature_column_types(labeled_df)
+        expected = {c for c in labeled_df.columns
+                    if c not in ("label", "binary_label")}
+        actual = set(cat_cols) | set(num_cols)
+        assert actual == expected
+
+    def test_raises_value_error_for_unknown_rule(self, labeled_df):
+        """ValueError is raised when rule is not 'dtype_object'."""
+        with pytest.raises(ValueError, match="dtype_object"):
+            infer_feature_column_types(labeled_df, rule="pearson_correlation")
+
+    def test_default_rule_is_dtype_object(self, labeled_df):
+        """Default call (no rule arg) uses dtype_object and succeeds."""
+        # Must not raise
+        cat_cols, num_cols = infer_feature_column_types(labeled_df)
+        assert isinstance(cat_cols, list)
+        assert isinstance(num_cols, list)
+
+    def test_custom_label_columns_respected(self, labeled_df):
+        """Custom label_columns argument is honoured."""
+        # Treat 'binary_label' as a feature instead of a label
+        cat_cols, num_cols = infer_feature_column_types(
+            labeled_df, label_columns=["label"]
+        )
+        # binary_label is numeric (int), so it should appear in num_cols
+        assert "binary_label" in num_cols
+
+
+# ---------------------------------------------------------------------------
+# split_train_test — SDS Section 14.2
+# ---------------------------------------------------------------------------
+
+class TestSplitTrainTest:
+    """Tests for split_train_test."""
+
+    def test_returns_two_arrays(self, labeled_df):
+        """split_train_test returns a tuple of two numpy arrays."""
+        train_idx, test_idx = split_train_test(labeled_df, "label", 0.2, 42)
+        assert isinstance(train_idx, np.ndarray)
+        assert isinstance(test_idx, np.ndarray)
+
+    def test_union_covers_full_dataset(self, labeled_df):
+        """train_indices ∪ test_indices == all row indices of df."""
+        train_idx, test_idx = split_train_test(labeled_df, "label", 0.2, 42)
+        all_indices = set(range(len(labeled_df)))
+        assert set(train_idx) | set(test_idx) == all_indices
+
+    def test_indices_are_non_overlapping(self, labeled_df):
+        """train_indices ∩ test_indices == ∅ (no row appears in both)."""
+        train_idx, test_idx = split_train_test(labeled_df, "label", 0.2, 42)
+        assert len(set(train_idx) & set(test_idx)) == 0
+
+    def test_split_sizes_respect_test_size(self, labeled_df):
+        """Test split size is approximately test_size of the full dataset."""
+        train_idx, test_idx = split_train_test(labeled_df, "label", 0.2, 42)
+        total = len(labeled_df)
+        assert len(train_idx) + len(test_idx) == total
+        # Allow ±1 row tolerance due to stratification rounding
+        assert abs(len(test_idx) - round(total * 0.2)) <= 1
+
+    def test_deterministic_given_same_seed(self, labeled_df):
+        """Same seed produces identical index arrays across two calls."""
+        train1, test1 = split_train_test(labeled_df, "label", 0.2, 42)
+        train2, test2 = split_train_test(labeled_df, "label", 0.2, 42)
+        assert np.array_equal(np.sort(train1), np.sort(train2))
+        assert np.array_equal(np.sort(test1), np.sort(test2))
+
+    def test_raises_value_error_on_single_sample_class(self):
+        """ValueError raised if any class has fewer than 2 samples."""
+        df = pd.DataFrame(
+            {
+                "feature": [1.0, 2.0, 3.0],
+                "label": ["A", "A", "B"],  # 'B' has only 1 sample
+                "binary_label": [0, 0, 1],
+            }
+        )
+        with pytest.raises(ValueError):
+            split_train_test(df, "label", 0.3, 42)
+
+
+# ---------------------------------------------------------------------------
+# prepare_model_ready_data — SDS Section 14.2
+# ---------------------------------------------------------------------------
+
+class TestPrepareModelReadyData:
+    """Tests for prepare_model_ready_data."""
+
+    def _make_processed_df(self) -> pd.DataFrame:
+        """Synthetic fully-processed (encoded, scaled) DataFrame."""
+        return pd.DataFrame(
+            {
+                "proto_enc": [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+                "frame_len_sc": [0.1, 0.5, 0.3, 0.9, 0.2, 0.7],
+                "port_sc": [0.2, 0.8, 0.4, 0.1, 0.6, 0.3],
+                "label": [
+                    "Normal", "DDoS_HTTP", "Normal",
+                    "MITM", "DDoS_HTTP", "MITM",
+                ],
+                "binary_label": [0, 1, 0, 1, 1, 1],
+            }
+        )
+
+    def _make_label_encoder(self, labels) -> LabelEncoder:
+        """Fit and return a LabelEncoder on given labels."""
+        le = LabelEncoder()
+        le.fit(labels)
+        return le
+
+    def test_x_shape(self):
+        """X shape is (n_samples, n_features, 1)."""
+        df = self._make_processed_df()
+        feature_cols = ["proto_enc", "frame_len_sc", "port_sc"]
+        le = self._make_label_encoder(df["label"])
+        n_classes = len(le.classes_)
+        indices = np.arange(len(df))
+        X, _ = prepare_model_ready_data(df, indices, feature_cols, le, n_classes)
+        assert X.shape == (len(df), len(feature_cols), 1)
+
+    def test_y_shape_one_hot(self):
+        """y shape is (n_samples, num_classes) — one-hot encoded."""
+        df = self._make_processed_df()
+        feature_cols = ["proto_enc", "frame_len_sc", "port_sc"]
+        le = self._make_label_encoder(df["label"])
+        n_classes = len(le.classes_)
+        indices = np.arange(len(df))
+        _, y = prepare_model_ready_data(df, indices, feature_cols, le, n_classes)
+        assert y.shape == (len(df), n_classes)
+
+    def test_y_rows_sum_to_one(self):
+        """Each row of y sums to 1.0 (valid one-hot encoding)."""
+        df = self._make_processed_df()
+        feature_cols = ["proto_enc", "frame_len_sc", "port_sc"]
+        le = self._make_label_encoder(df["label"])
+        n_classes = len(le.classes_)
+        indices = np.arange(len(df))
+        _, y = prepare_model_ready_data(df, indices, feature_cols, le, n_classes)
+        assert np.allclose(y.sum(axis=1), 1.0)
+
+    def test_index_subset_works(self):
+        """prepare_model_ready_data correctly selects a row subset via indices."""
+        df = self._make_processed_df()
+        feature_cols = ["proto_enc", "frame_len_sc", "port_sc"]
+        le = self._make_label_encoder(df["label"])
+        n_classes = len(le.classes_)
+        subset_indices = np.array([0, 2, 4])
+        X, y = prepare_model_ready_data(
+            df, subset_indices, feature_cols, le, n_classes
+        )
+        assert X.shape[0] == 3
+        assert y.shape[0] == 3
+
+    def test_x_values_match_dataframe(self):
+        """X values match the corresponding rows/columns in the DataFrame."""
+        df = self._make_processed_df()
+        feature_cols = ["proto_enc", "frame_len_sc", "port_sc"]
+        le = self._make_label_encoder(df["label"])
+        n_classes = len(le.classes_)
+        indices = np.array([0, 1])
+        X, _ = prepare_model_ready_data(df, indices, feature_cols, le, n_classes)
+        expected = df.loc[indices, feature_cols].values.reshape(-1, 3, 1)
+        assert np.allclose(X, expected)
+
+
+# ---------------------------------------------------------------------------
+# Leakage regression test — SDS Section 14.2 / Section 19
+# ---------------------------------------------------------------------------
+
+class TestLeakageRegression:
+    """Regression tests guarding against train/test leakage.
+
+    SDS Section 19 requires: 'encoders/scaler fit only on a training slice
+    produce different parameters than if fit on the full dataset (regression
+    test guarding against the leakage bug the pipeline order in Section 14.2
+    exists to prevent).'
+    """
+
+    def _make_asymmetric_df(self) -> pd.DataFrame:
+        """DataFrame where train and test rows have different value ranges.
+
+        The training rows (indices 0-5) have numeric values in [10, 50].
+        The test rows (indices 6-9) have values in [100, 900].
+        If the scaler is fit on the full dataset its min/max will differ
+        substantially from a train-only fit.
+        """
+        return pd.DataFrame(
+            {
+                "cat_col": ["a", "b", "a", "b", "a", "b", "c", "c", "c", "c"],
+                "num_col": [10.0, 20.0, 30.0, 40.0, 50.0, 15.0,
+                            100.0, 200.0, 500.0, 900.0],
+                "label": [
+                    "Normal", "Attack", "Normal", "Attack",
+                    "Normal", "Attack", "Normal", "Attack",
+                    "Normal", "Attack",
+                ],
+                "binary_label": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+            }
+        )
+
+    def test_scaler_train_only_differs_from_full_dataset_fit(self):
+        """MinMaxScaler fit on train-only rows has different scale_ than full fit.
+
+        This is the canonical leakage regression required by SDS Section 19.
+        """
+        df = self._make_asymmetric_df()
+        train_indices = np.array([0, 1, 2, 3, 4, 5])   # low-range rows
+        numeric_columns = ["num_col"]
+
+        # Fit on training slice only (correct, no leakage)
+        _, scaler_train_only = fit_scaler(df.loc[train_indices], numeric_columns)
+
+        # Fit on full dataset (WRONG — leakage — what this test guards against)
+        _, scaler_full = fit_scaler(df, numeric_columns)
+
+        # The data_max_ must differ: train-only sees max=50, full sees max=900
+        train_max = scaler_train_only.data_max_[0]
+        full_max = scaler_full.data_max_[0]
+        assert train_max != full_max, (
+            "Train-only scaler and full-dataset scaler have identical data_max_ "
+            "— this indicates a leakage bug in the pipeline order."
+        )
+
+    def test_categorical_encoder_train_only_differs_from_full_fit(self):
+        """OrdinalEncoder fit on training rows only is unaware of test-only categories.
+
+        Training rows contain categories 'a' and 'b'; test rows introduce 'c'.
+        A train-only encoder should not have seen 'c' during fitting.
+        """
+        df = self._make_asymmetric_df()
+        train_indices = np.array([0, 1, 2, 3, 4, 5])   # only 'a' and 'b'
+        cat_cols = ["cat_col"]
+
+        _, enc_train_only = fit_categorical_encoder(
+            df.loc[train_indices], cat_cols
+        )
+        _, enc_full = fit_categorical_encoder(df, cat_cols)
+
+        # Train-only encoder knows 2 categories; full encoder knows 3
+        train_categories = enc_train_only.categories_[0].tolist()
+        full_categories = enc_full.categories_[0].tolist()
+        assert len(train_categories) != len(full_categories), (
+            "Train-only and full-dataset categorical encoders have the same "
+            "category list — this indicates a leakage bug."
+        )
+        assert "c" not in train_categories
+        assert "c" in full_categories
+
