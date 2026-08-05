@@ -54,6 +54,9 @@ from src.models.cnn_gru import (
     save_model_architecture_diagram,
 )
 from src.partitioning.partition_data import partition_iid
+from src.preprocessing.encode_normalize import prepare_model_ready_data
+from src.utils.dataio import read_processed
+
 
 # Module-level logger only. Modules under src/ never create log files; the five
 # fixed log files are created exclusively by experiments/ scripts via
@@ -217,7 +220,78 @@ def weighted_average_eval(metrics: list[tuple[int, dict]]) -> dict:
     return {"accuracy": weighted_accuracy}
 
 
-def get_strategy(config: dict) -> SavingFedAvg:
+def make_server_side_evaluate_fn(
+    config: dict,
+    X_test,
+    y_test,
+    num_features: int,
+    num_classes: int,
+    logger: logging.Logger,
+):
+    """Build the server-side centralized evaluation callback.
+
+    Purpose:
+        Client-side distributed evaluation answers "how does the global model
+        do on each client's copy of the test split?"; it is aggregated by
+        example count and is the only signal the project previously recorded.
+        Flower's ``evaluate_fn`` hook answers a different and more
+        authoritative question: how does the *aggregated* model score on the
+        shared global test split, evaluated exactly once, on the server, with
+        no per-client weighting artefacts.
+
+        Having both matters here because a divergence between the two is the
+        standard symptom of aggregation going wrong (e.g. weights averaged in
+        the wrong order, or a client returning stale parameters). With only
+        distributed evaluation, that failure is invisible.
+
+        The returned closure keeps ``X_test``/``y_test`` bound once, so the
+        test tensors are built a single time for the whole simulation rather
+        than per round.
+
+    Args:
+        config: Loaded config dict; ``training.batch_size`` is read.
+        X_test: Shared global test features, shape ``(n, num_features, 1)``.
+        y_test: Shared global test labels, one-hot, shape ``(n, num_classes)``.
+        num_features: Feature count for rebuilding the model shell.
+        num_classes: Class count for rebuilding the model shell.
+        logger: Logger to record per-round centralized metrics.
+
+    Returns:
+        Callable: A Flower ``evaluate_fn`` with signature
+            ``(server_round, parameters_ndarrays, config) ->
+            (loss, {"accuracy": acc})``.
+    """
+    # The model shell is built once and reused across rounds; only the weights
+    # change. Rebuilding a Keras model 15 times would add graph-construction
+    # overhead to every round for no benefit.
+    eval_model = build_cnn_gru(
+        input_shape=(num_features, 1),
+        num_classes=num_classes,
+        model_config=config["model"],
+        training_config=config["training"],
+    )
+    batch_size = config["training"]["batch_size"]
+
+    def evaluate_fn(server_round, parameters_ndarrays, eval_config):
+        eval_model.set_weights(parameters_ndarrays)
+        loss, accuracy = eval_model.evaluate(
+            X_test, y_test, batch_size=batch_size, verbose=0
+        )
+        logger.info(
+            "Round %d — SERVER-SIDE centralized evaluation on the shared "
+            "global test split: loss=%.6f accuracy=%.6f (%d samples)",
+            server_round,
+            loss,
+            accuracy,
+            len(X_test),
+        )
+        return float(loss), {"accuracy": float(accuracy)}
+
+    return evaluate_fn
+
+
+def get_strategy(config: dict, evaluate_fn=None) -> SavingFedAvg:
+
     """Construct the federated aggregation strategy from the config.
 
     Purpose:
@@ -255,7 +329,11 @@ def get_strategy(config: dict) -> SavingFedAvg:
         min_evaluate_clients=num_clients,
         fit_metrics_aggregation_fn=weighted_average_fit,
         evaluate_metrics_aggregation_fn=weighted_average_eval,
+        # Server-side centralized evaluation. Optional so the smoke test and
+        # the unit tests can construct a strategy without building tensors.
+        evaluate_fn=evaluate_fn,
     )
+
 
     _logger.info(
         "SavingFedAvg strategy constructed — min_available_clients=%d "
@@ -349,7 +427,8 @@ def run_federated_simulation(
             config["paths"]["processed_data_file"],
         )
         logger.info("Loading processed dataset from '%s'", processed_csv_path)
-        df = pandas.read_csv(processed_csv_path)
+        df = read_processed(processed_csv_path)
+
         logger.info(
             "Processed dataset loaded: %d rows x %d columns",
             df.shape[0],
@@ -415,8 +494,28 @@ def run_federated_simulation(
             config=client_runtime_config,
         )
 
+        # ---- Server-side centralized evaluation --------------------------
+        # Built once, outside the timed region, so the tensor construction
+        # cost is not attributed to federated training time.
+        X_test_global, y_test_global = prepare_model_ready_data(
+            test_data_global,
+            test_data_global.index.values,
+            feature_columns,
+            label_encoder,
+            num_classes,
+        )
+        server_evaluate_fn = make_server_side_evaluate_fn(
+            config,
+            X_test_global,
+            y_test_global,
+            num_features,
+            num_classes,
+            logger,
+        )
+
         # ---- Run the simulation (time.time() wraps ONLY this call) -------
-        strategy = get_strategy(config)
+        strategy = get_strategy(config, evaluate_fn=server_evaluate_fn)
+
         logger.info(
             "Starting Flower simulation — %d clients x %d rounds ...",
             num_clients,
@@ -445,6 +544,13 @@ def run_federated_simulation(
         # round, aggregated_loss, aggregated_accuracy.
         losses = dict(history.losses_distributed)
         accuracies = dict(history.metrics_distributed.get("accuracy", []))
+        # Server-side centralized metrics, recorded alongside the distributed
+        # ones so a divergence between the two is visible in the CSV rather
+        # than only in the log.
+        central_losses = dict(history.losses_centralized)
+        central_accuracies = dict(
+            history.metrics_centralized.get("accuracy", [])
+        )
         history_rows = []
         for server_round in sorted(losses):
             aggregated_loss = losses[server_round]
@@ -454,14 +560,22 @@ def run_federated_simulation(
                     "round": server_round,
                     "aggregated_loss": aggregated_loss,
                     "aggregated_accuracy": aggregated_accuracy,
+                    "centralized_loss": central_losses.get(server_round),
+                    "centralized_accuracy": central_accuracies.get(
+                        server_round
+                    ),
                 }
             )
             logger.info(
-                "Round %d — aggregated_loss=%.6f aggregated_accuracy=%.6f",
+                "Round %d — distributed: loss=%.6f accuracy=%.6f | "
+                "centralized: loss=%s accuracy=%s",
                 server_round,
                 aggregated_loss,
                 aggregated_accuracy,
+                central_losses.get(server_round),
+                central_accuracies.get(server_round),
             )
+
 
         history_df = pandas.DataFrame(history_rows)
         logger.info(

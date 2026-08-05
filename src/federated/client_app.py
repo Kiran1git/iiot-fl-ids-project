@@ -48,6 +48,9 @@ import logging
 import numpy
 import pandas
 from flwr.client import NumPyClient
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+
 
 from src.models.cnn_gru import build_cnn_gru
 from src.partitioning.partition_data import partition_iid
@@ -150,6 +153,91 @@ class FLClient(NumPyClient):
             training_config=config["training"],
         )
 
+        # ---- Local train/validation split of this client's OWN shard -------
+        # Previously every client evaluated on the identical shared global test
+        # split, which made client-side distributed evaluation degenerate: four
+        # clients returned four copies of the same number, and
+        # weighted_average_eval averaged a constant. Worse, all four then
+        # reported a score on data the server also uses as the final held-out
+        # test set, so the "federated" evaluation signal was neither federated
+        # nor held out.
+        #
+        # Each client now holds out a fraction of its own shard as a local
+        # validation split. Distributed evaluation becomes four genuinely
+        # different local scores (which is what FedAvg's example-weighted
+        # aggregation is designed for), and the shared global test split is
+        # touched exactly once per round by the server itself.
+        validation_fraction = config["federated"].get("client_val_split", 0.0)
+        local_train = train_data
+        local_validation = train_data
+        if 0.0 < validation_fraction < 1.0 and len(train_data) > 1:
+            stratify_labels = train_data["label"]
+            # Stratification needs >= 2 rows per class; a small shard may not
+            # satisfy that, in which case fall back to an unstratified split
+            # rather than failing the round.
+            if stratify_labels.value_counts().min() < 2:
+                stratify_labels = None
+            local_train, local_validation = train_test_split(
+                train_data,
+                test_size=validation_fraction,
+                random_state=config["seed"],
+                stratify=stratify_labels,
+            )
+
+        # ---- Tensor caching -----------------------------------------------
+        # prepare_model_ready_data was previously called inside fit() AND
+        # inside evaluate(), i.e. 2x per client per round -> 120 conversions of
+        # the same rows over a 4-client, 15-round run. The conversion is a
+        # to_numpy + reshape over ~390k x 95 values, so this was pure repeated
+        # work. Built once here instead.
+        self.X_train, self.y_train = prepare_model_ready_data(
+            local_train,
+            local_train.index.values,
+            self.feature_columns,
+            self.label_encoder,
+            self.num_classes,
+        )
+        self.X_validation, self.y_validation = prepare_model_ready_data(
+            local_validation,
+            local_validation.index.values,
+            self.feature_columns,
+            self.label_encoder,
+            self.num_classes,
+        )
+        self.num_train_examples = len(self.X_train)
+        self.num_validation_examples = len(self.X_validation)
+
+        # ---- Local class weights ------------------------------------------
+        # Same rationale as the centralized path: without rebalancing, a client
+        # whose shard is ~85% Normal converges to predicting Normal. Weights are
+        # derived from this client's own local training rows only — a client
+        # cannot see any other client's label distribution, which is exactly
+        # the federated privacy constraint.
+        self.class_weight = None
+        if config["training"].get("use_class_weights", False):
+            y_train_int = numpy.argmax(self.y_train, axis=1)
+            present_classes = numpy.unique(y_train_int)
+            if len(present_classes) > 1:
+                weights = compute_class_weight(
+                    class_weight="balanced",
+                    classes=present_classes,
+                    y=y_train_int,
+                )
+                self.class_weight = {
+                    int(cls): float(weight)
+                    for cls, weight in zip(present_classes, weights)
+                }
+
+        _logger.debug(
+            "Client %s initialised — local_train=%d local_val=%d "
+            "class_weighted=%s",
+            self.client_id,
+            self.num_train_examples,
+            self.num_validation_examples,
+            self.class_weight is not None,
+        )
+
+
     def get_parameters(self, config: dict) -> list[numpy.ndarray]:
         """Return the current local model weights.
 
@@ -191,8 +279,10 @@ class FLClient(NumPyClient):
         Returns:
             tuple[list[numpy.ndarray], int, dict]:
                 - Updated local weights after local training.
-                - ``len(self.train_data)`` — this client's training example
-                  count, used by the server as the aggregation weight.
+                - ``self.num_train_examples`` — this client's LOCAL TRAINING
+                  example count (shard minus local validation split), used by
+                  the server as the FedAvg aggregation weight.
+
                 - Metrics dict ``{"loss": ..., "accuracy": ...}`` taken from
                   the final local epoch of ``history.history``. **Both keys
                   are always present**, because this dict is consumed
@@ -206,22 +296,18 @@ class FLClient(NumPyClient):
         try:
             self.model.set_weights(parameters)
 
-            # Sole tensor-preparation entry point (SDS Section 14.2 / 22).
-            X_train, y_train = prepare_model_ready_data(
-                self.train_data,
-                self.train_data.index.values,
-                self.feature_columns,
-                self.label_encoder,
-                self.num_classes,
-            )
-
+            # Tensors were built once in __init__ via the sole
+            # tensor-preparation entry point (SDS Section 14.2 / 22); rebuilding
+            # them every round would repeat the same conversion 15 times.
             history = self.model.fit(
-                X_train,
-                y_train,
+                self.X_train,
+                self.y_train,
                 epochs=self.config["federated"]["local_epochs"],
                 batch_size=self.config["training"]["batch_size"],
+                class_weight=self.class_weight,
                 verbose=0,
             )
+
 
             # Final local epoch's values — both keys are mandatory.
             metrics = {
@@ -232,12 +318,20 @@ class FLClient(NumPyClient):
             _logger.debug(
                 "Client %s fit complete — examples=%d loss=%.6f accuracy=%.6f",
                 self.client_id,
-                len(self.train_data),
+                self.num_train_examples,
                 metrics["loss"],
                 metrics["accuracy"],
             )
 
-            return self.model.get_weights(), len(self.train_data), metrics
+            # The example count is the client's LOCAL TRAINING count, which is
+            # FedAvg's aggregation weight. It must exclude the local validation
+            # rows, since those did not contribute a single gradient.
+            return (
+                self.model.get_weights(),
+                self.num_train_examples,
+                metrics,
+            )
+
 
         except Exception:
             _logger.error(
@@ -252,13 +346,20 @@ class FLClient(NumPyClient):
         parameters: list[numpy.ndarray],
         config: dict,
     ) -> tuple[float, int, dict]:
-        """Evaluate the global weights on the shared global test split.
+        """Evaluate the global weights on this client's local validation split.
 
         Purpose:
             Load the server's global weights and evaluate them against the
-            shared global test split — the exact same held-out data used by the
-            centralized baseline, so the federated-vs-centralized comparison
-            differs only in how the model was trained (SDS Section 14.3).
+            fraction of this client's own shard held out in ``__init__``
+            (``federated.client_val_split``). Distributed evaluation therefore
+            reports four genuinely different local scores, which is what
+            FedAvg's example-weighted aggregation is designed to combine.
+
+            The shared global test split is evaluated once per round by the
+            server itself (``make_server_side_evaluate_fn`` in
+            ``server_app.py``), so it remains a true held-out set instead of
+            being scored by every client every round.
+
 
         Args:
             parameters: The global model weights sent by the server.
@@ -270,7 +371,9 @@ class FLClient(NumPyClient):
                 - ``loss`` from ``model.evaluate`` — returned as the first
                   tuple element so Flower aggregates it natively into
                   ``history.losses_distributed``.
-                - ``len(self.test_data)`` — the test example count.
+                - ``self.num_validation_examples`` — this client's local
+                  validation row count, used as the aggregation weight.
+
                 - Metrics dict ``{"accuracy": ...}``. **Only ``accuracy`` is
                   present**, because this dict is consumed exclusively by
                   ``weighted_average_eval``, which reads only that key
@@ -283,26 +386,32 @@ class FLClient(NumPyClient):
         try:
             self.model.set_weights(parameters)
 
-            # The shared global test split — never a per-client partition.
-            X_test, y_test = prepare_model_ready_data(
-                self.test_data,
-                self.test_data.index.values,
-                self.feature_columns,
-                self.label_encoder,
-                self.num_classes,
+            # This client's OWN local validation split, cached in __init__.
+            # The shared global test split is deliberately not touched here:
+            # it is evaluated once per round by the server itself, so it stays
+            # a genuine held-out set rather than a per-round training signal.
+            loss, accuracy = self.model.evaluate(
+                self.X_validation,
+                self.y_validation,
+                batch_size=self.config["training"]["batch_size"],
+                verbose=0,
             )
 
-            loss, accuracy = self.model.evaluate(X_test, y_test, verbose=0)
-
             _logger.debug(
-                "Client %s evaluate complete — examples=%d loss=%.6f accuracy=%.6f",
+                "Client %s evaluate complete — local_val_examples=%d "
+                "loss=%.6f accuracy=%.6f",
                 self.client_id,
-                len(self.test_data),
+                self.num_validation_examples,
                 float(loss),
                 float(accuracy),
             )
 
-            return float(loss), len(self.test_data), {"accuracy": float(accuracy)}
+            return (
+                float(loss),
+                self.num_validation_examples,
+                {"accuracy": float(accuracy)},
+            )
+
 
         except Exception:
             _logger.error(

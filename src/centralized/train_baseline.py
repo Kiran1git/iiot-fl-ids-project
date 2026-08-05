@@ -29,7 +29,9 @@ import os
 import pickle
 import time
 
+import numpy as np
 import pandas as pd
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
 from src.models.cnn_gru import (
@@ -38,6 +40,8 @@ from src.models.cnn_gru import (
     save_model_architecture_diagram,
 )
 from src.preprocessing.encode_normalize import prepare_model_ready_data
+from src.utils.dataio import read_processed
+
 
 
 def train_centralized_model(
@@ -107,7 +111,8 @@ def train_centralized_model(
             config["paths"]["processed_data_file"],
         )
         logger.info("Loading processed dataset from '%s'", processed_csv_path)
-        df = pd.read_csv(processed_csv_path)
+        df = read_processed(processed_csv_path)
+
         logger.info(
             "Processed dataset loaded: %d rows x %d columns",
             df.shape[0],
@@ -186,6 +191,48 @@ def train_centralized_model(
             ),
         ]
 
+        # ---- Class weights ------------------------------------------------
+        # Edge-IIoTset is imbalanced by a factor of ~1600:1 (Normal vs
+        # Fingerprinting). Unweighted categorical crossentropy lets the model
+        # reach ~96% accuracy while never once predicting the rarest attack
+        # classes, because ignoring a 1,001-row class costs 0.045% accuracy.
+        # For an IDS, a missed attack class is the failure mode that matters,
+        # so the loss is rebalanced by inverse class frequency.
+        #
+        # Weights are computed from TRAINING labels only — the test split must
+        # not influence any fitted quantity, and a class weight derived from
+        # test-set frequencies would be exactly that.
+        class_weight = None
+        if config["training"].get("use_class_weights", False):
+            y_train_int = np.argmax(y_train, axis=1)
+            present_classes = np.unique(y_train_int)
+            balanced_weights = compute_class_weight(
+                class_weight="balanced",
+                classes=present_classes,
+                y=y_train_int,
+            )
+            class_weight = {
+                int(cls): float(weight)
+                for cls, weight in zip(present_classes, balanced_weights)
+            }
+            logger.info(
+                "Class weights enabled (balanced, computed on training rows "
+                "only): %s",
+                {
+                    class_mapping[str(cls)]: round(weight, 4)
+                    for cls, weight in class_weight.items()
+                },
+            )
+        else:
+            logger.warning(
+                "Class weights are disabled. With a %d:1 imbalance the model "
+                "can score high accuracy while ignoring rare attack classes.",
+                int(
+                    df["label"].value_counts().max()
+                    / max(df["label"].value_counts().min(), 1)
+                ),
+            )
+
         # ---- Train (time.time() wraps ONLY the .fit() call) --------------
         logger.info("Starting centralized training ...")
         start_time = time.time()
@@ -195,9 +242,11 @@ def train_centralized_model(
             epochs=config["training"]["centralized_epochs"],
             batch_size=config["training"]["batch_size"],
             validation_split=config["training"]["validation_split"],
+            class_weight=class_weight,
             callbacks=callbacks,
         )
         training_time_seconds = time.time() - start_time
+
 
         # ---- Per-epoch logging ------------------------------------------
         history_df = pd.DataFrame(history.history)

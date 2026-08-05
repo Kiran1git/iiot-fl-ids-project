@@ -28,8 +28,8 @@ from src.utils.seed import set_global_seed
 from src.utils.logger import get_logger
 from src.preprocessing.encode_normalize import run_preprocessing_pipeline
 from src.evaluation.metrics import generate_class_distribution_plot
+from src.utils.dataio import read_processed
 
-import pandas as pd
 
 
 def main() -> None:
@@ -64,8 +64,12 @@ def main() -> None:
             processed_csv_path,
             plot_path,
         )
-        df_processed = pd.read_csv(processed_csv_path)
+        # Only the label column is needed for the distribution plot. Parquet is
+        # columnar, so this reads one column instead of materialising the whole
+        # ~1.9M x 95 frame purely to call value_counts on it.
+        df_processed = read_processed(processed_csv_path, columns=["label"])
         generate_class_distribution_plot(df_processed, "label", plot_path)
+
         logger.info("Class distribution plot saved to '%s'", plot_path)
 
     except Exception:

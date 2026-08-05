@@ -4,7 +4,8 @@ paths:
   raw_data_dir: "data/raw"
   raw_data_file: "edge_iiotset.csv"
   processed_data_dir: "data/processed"
-  processed_data_file: "edge_iiotset_processed.csv"
+  processed_data_file: "edge_iiotset_processed.parquet"
+
   artifacts_dir: "outputs/artifacts"
   models_dir: "outputs/models"
   results_dir: "outputs/results"
@@ -30,9 +31,33 @@ dataset:
     - "tcp.payload"
     - "dns.qry.name.len"
     - "mqtt.msg"
-  categorical_column_rule: "dtype_object"   # the only implemented rule (Section 14.2); passed explicitly into
-                                             # infer_feature_column_types so the config key is never unused
+    # --- Leakage fixes (see project-docs/PREP_FIXES.md) -------------------
+    # frame.time: per-packet capture timestamp, 1,765,009 distinct values over
+    #   1,775,360 training rows — a row identifier. Ordinal-encoding it gave the
+    #   model the capture order, which is almost perfectly correlated with the
+    #   attack label because Edge-IIoTset was captured attack-by-attack.
+    - "frame.time"
+    # tcp.srcport: ephemeral source port, 61,975 distinct object-dtype values.
+    #   An identifier, not a protocol signal.
+    - "tcp.srcport"
+    # http.request.uri.query: 5,526 distinct raw query strings. Encoding these
+    #   memorises specific attack payloads rather than learning generalisable
+    #   behaviour.
+    - "http.request.uri.query"
+  categorical_column_rule: "cardinality"    # "cardinality" (production) splits categoricals into
+                                            # low/high-cardinality groups so nominal features are
+                                            # one-hot encoded instead of ordinal-encoded.
+                                            # "dtype_object" is the legacy single-group rule.
+  # Categoricals with <= low_cardinality_max distinct TRAINING values are
+  # one-hot encoded (no false ordering). Anything above is frequency-encoded.
+  low_cardinality_max: 20
+  high_cardinality_strategy: "frequency"
+  # Exact duplicate rows (identical features AND identical label) are removed
+  # BEFORE the train/test split. Measured at ~13% of the raw data; leaving them
+  # in places byte-identical copies of training rows into the test split.
+  drop_duplicates: true
   force_reprocess: false
+
 
 model:
   conv_filters: 64
@@ -56,6 +81,11 @@ training:
   validation_split: 0.2
   early_stopping_patience: 3
   early_stopping_monitor: "val_loss"
+  # Edge-IIoTset is extremely imbalanced: Normal has 1,615,643 rows against
+  # Fingerprinting's 1,001 (1614:1). With unweighted categorical crossentropy a
+  # model that never predicts the rare attack classes still scores ~96%
+  # accuracy. Balanced class weights make the rare-class recall trainable.
+  use_class_weights: true
 
 federated:
   num_clients: 4
@@ -65,6 +95,13 @@ federated:
   min_available_clients: 4
   min_fit_clients: 4
   min_evaluate_clients: 4
+  # Fraction of each client's own shard held out as a LOCAL validation split.
+  # FLClient.evaluate reports on this local split, so weighted_average_eval
+  # aggregates four genuinely different numbers instead of four copies of the
+  # same global-test-set score. The global test set is evaluated once per round
+  # by the server itself (server-side central evaluation).
+  client_val_split: 0.2
+
 
 explainability:
   method: "GradientExplainer"

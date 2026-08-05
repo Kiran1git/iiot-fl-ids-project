@@ -98,6 +98,10 @@ def _make_reduced_config() -> dict:
             "learning_rate": 0.001,
             "loss": "categorical_crossentropy",
             "batch_size": 8,
+            # Off for the smoke test: the synthetic frame is perfectly balanced
+            # by construction, so weighting would be a no-op that only slows
+            # the test down.
+            "use_class_weights": False,
         },
         "federated": {
             "num_clients": REDUCED_NUM_CLIENTS,
@@ -107,7 +111,10 @@ def _make_reduced_config() -> dict:
             "min_available_clients": REDUCED_NUM_CLIENTS,
             "min_fit_clients": REDUCED_NUM_CLIENTS,
             "min_evaluate_clients": REDUCED_NUM_CLIENTS,
+            # Each client holds out 20% of its own shard for local evaluation.
+            "client_val_split": 0.2,
         },
+
         "runtime": {
             "feature_columns": FEATURE_COLUMNS,
             "label_encoder": LabelEncoder().fit(CLASS_NAMES),
