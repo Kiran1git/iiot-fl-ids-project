@@ -1,4 +1,4 @@
-"""Federated server, strategy, and simulation wiring — Phase 9.
+"""Federated server, strategy, and simulation wiring.
 
 This module owns the project's single federated aggregation strategy and its
 two distinct metrics-aggregation functions (SDS Section 14.6).
@@ -23,12 +23,11 @@ Ownership and reuse rules:
   - Every simulated client evaluates against the identical shared global test
     split — never a per-client test partition (SDS Section 14.3).
 
-Phase scope: ``run_federated_simulation`` is intentionally a signature-only
-stub in this phase. Its full body — data loading, sharding, the
-``start_simulation`` call, the ``parameters_to_ndarrays`` →
-``build_cnn_gru`` → ``set_weights`` → save sequence, and all artifact
-persistence — is deferred to Phase 10, which is the only phase permitted to
-modify this file and may add that body ONLY.
+``run_federated_simulation`` is the project's single top-level federated
+orchestrator. It loads the processed data and preprocessing artifacts, shards
+the training split via ``partition_iid``, runs the production-scale simulation
+through the pinned ``start_simulation`` API, and rebuilds the global model from
+``SavingFedAvg.latest_parameters`` — never from a per-client local model.
 
 Per the SDS Section 11 import graph, ``src/federated/`` imports only from
 ``src/utils/``, ``src/preprocessing/``, ``src/partitioning/``, and
@@ -36,9 +35,25 @@ Per the SDS Section 11 import graph, ``src/federated/`` imports only from
 or ``src/explainability/``.
 """
 
+import json
 import logging
+import os
+import pickle
+import time
+from functools import partial
 
+import flwr
+import pandas
+from flwr.common import parameters_to_ndarrays
 from flwr.server.strategy import FedAvg
+
+from src.federated.client_app import client_fn
+from src.models.cnn_gru import (
+    build_cnn_gru,
+    get_model_summary_string,
+    save_model_architecture_diagram,
+)
+from src.partitioning.partition_data import partition_iid
 
 # Module-level logger only. Modules under src/ never create log files; the five
 # fixed log files are created exclusively by experiments/ scripts via
@@ -256,35 +271,289 @@ def get_strategy(config: dict) -> SavingFedAvg:
     return strategy
 
 
-def run_federated_simulation(config: dict) -> None:
+def run_federated_simulation(
+    config: dict,
+    logger: logging.Logger = None,
+) -> None:
     """Run the full federated simulation and persist the global model.
 
     Purpose:
-        The project's single top-level federated orchestrator: partition the
-        training split, launch ``flwr.simulation.start_simulation`` for
+        The project's single top-level federated orchestrator (SDS Section
+        14.6): load the processed dataset and preprocessing artifacts, shard
+        the training split via ``partition_iid``, launch
+        ``flwr.simulation.start_simulation`` for
         ``config["federated"]["num_rounds"]`` rounds using the pinned
-        ``flwr==1.8.0`` API, capture the final aggregated global model from
-        ``SavingFedAvg.latest_parameters``, time the run, and persist all
-        federated artifacts (SDS Section 14.6).
+        ``flwr==1.8.0`` client-function/strategy API, time only that call,
+        rebuild the global model from ``SavingFedAvg.latest_parameters``, and
+        persist every federated artifact named in SDS Section 9.
 
-        **Phase 9 scope:** this is a signature-only stub. The full body is
-        deferred to Phase 10, which is the only phase permitted to modify this
-        file and may add this body ONLY — no other function here may be
-        altered. No second simulation entry point may ever be introduced.
+        The saved ``federated_global_model.h5`` is *always* built by converting
+        ``strategy.latest_parameters`` via ``parameters_to_ndarrays`` and
+        loading those weights into a freshly constructed ``build_cnn_gru``
+        model. A per-client local model is never saved under that filename
+        (SDS Section 14.6, Section 22).
+
+        Only the shared global test split is used for client-side evaluation —
+        ``partition_iid`` is applied to the training rows exclusively
+        (SDS Section 14.3).
 
     Args:
-        config: The loaded config dict.
+        config: Fully loaded config dict from
+            ``src.utils.config_loader.load_config()``. Production federated
+            values are read as-is: ``federated.num_clients`` (4),
+            ``federated.num_rounds`` (15), ``federated.local_epochs`` (2).
+        logger: Optional pre-constructed ``logging.Logger`` passed down from
+            ``experiments/run_federated.py``. Modules under ``src/`` never
+            construct their own log file (SDS Section 13), so when this is
+            omitted a plain handler-less logger is used.
 
     Returns:
         None
 
     Raises:
-        NotImplementedError: Always, at this phase. The implementation lands in
-            Phase 10 once the reduced-scale smoke test in
-            ``tests/test_federated_loop.py`` is green.
+        RuntimeError: If ``strategy.latest_parameters`` is still ``None`` after
+            the simulation, meaning no round ever aggregated successfully and
+            no global model can be built.
+        Propagates any Flower simulation exception (and any I/O exception
+        raised while loading artifacts or persisting outputs) after logging the
+        full stack trace at ERROR level.
     """
-    raise NotImplementedError(
-        "run_federated_simulation's body is deferred to Phase 10 (SDS Section "
-        "14.6). Phase 9 defines only its signature, alongside SavingFedAvg, "
-        "get_strategy, weighted_average_fit, and weighted_average_eval."
-    )
+    if logger is None:
+        logger = logging.getLogger("federated_training")
+
+    try:
+        artifacts_dir = config["paths"]["artifacts_dir"]
+        models_dir = config["paths"]["models_dir"]
+        results_dir = config["paths"]["results_dir"]
+
+        os.makedirs(models_dir, exist_ok=True)
+        os.makedirs(results_dir, exist_ok=True)
+
+        num_clients = config["federated"]["num_clients"]
+        num_rounds = config["federated"]["num_rounds"]
+
+        logger.info("=== run_federated_simulation starting ===")
+        logger.info(
+            "Federated config summary — num_clients=%s | num_rounds=%s | "
+            "local_epochs=%s | partition_strategy=%s | batch_size=%s",
+            num_clients,
+            num_rounds,
+            config["federated"]["local_epochs"],
+            config["federated"]["partition_strategy"],
+            config["training"]["batch_size"],
+        )
+
+        # ---- Load processed dataset -------------------------------------
+        processed_csv_path = os.path.join(
+            config["paths"]["processed_data_dir"],
+            config["paths"]["processed_data_file"],
+        )
+        logger.info("Loading processed dataset from '%s'", processed_csv_path)
+        df = pandas.read_csv(processed_csv_path)
+        logger.info(
+            "Processed dataset loaded: %d rows x %d columns",
+            df.shape[0],
+            df.shape[1],
+        )
+
+        # ---- Load preprocessing artifacts -------------------------------
+        def _load_pickle(filename: str):
+            path = os.path.join(artifacts_dir, filename)
+            with open(path, "rb") as handle:
+                return pickle.load(handle)
+
+        train_indices = _load_pickle("train_indices.pkl")
+        test_indices = _load_pickle("test_indices.pkl")
+        feature_columns = _load_pickle("feature_names.pkl")
+        label_encoder = _load_pickle("label_encoder.pkl")
+
+        class_mapping_path = os.path.join(artifacts_dir, "class_mapping.json")
+        with open(class_mapping_path, "r", encoding="utf-8") as handle:
+            class_mapping = json.load(handle)
+
+        # num_classes is always derived, never hardcoded (SDS Section 6).
+        num_classes = len(class_mapping)
+        num_features = len(feature_columns)
+        logger.info(
+            "Artifacts loaded — train=%d rows | test=%d rows | features=%d | "
+            "classes=%d",
+            len(train_indices),
+            len(test_indices),
+            num_features,
+            num_classes,
+        )
+
+        # ---- Shard the TRAINING split only (sole owner: partition_iid) ---
+        # The shared global test split is never partitioned per client
+        # (SDS Section 14.3).
+        client_shards = partition_iid(
+            df.loc[train_indices], num_clients, config["seed"]
+        )
+        test_data_global = df.loc[test_indices]
+        logger.info(
+            "Partitioned training split into %d IID shards — sizes=%s | "
+            "shared global test split=%d rows",
+            len(client_shards),
+            [len(shard) for shard in client_shards],
+            len(test_data_global),
+        )
+
+        # ---- Bind the client factory's closure inputs --------------------
+        # The shards, the shared test split, and the config are bound once so
+        # Flower's engine only ever supplies `cid`; nothing is re-read from
+        # disk per client (SDS Section 14.5).
+        client_runtime_config = dict(config)
+        client_runtime_config["runtime"] = {
+            "feature_columns": feature_columns,
+            "label_encoder": label_encoder,
+            "num_classes": num_classes,
+        }
+        bound_client_fn = partial(
+            client_fn,
+            client_shards=client_shards,
+            test_data=test_data_global,
+            config=client_runtime_config,
+        )
+
+        # ---- Run the simulation (time.time() wraps ONLY this call) -------
+        strategy = get_strategy(config)
+        logger.info(
+            "Starting Flower simulation — %d clients x %d rounds ...",
+            num_clients,
+            num_rounds,
+        )
+        start_time = time.time()
+        history = flwr.simulation.start_simulation(
+            client_fn=bound_client_fn,
+            num_clients=num_clients,
+            config=flwr.server.ServerConfig(num_rounds=num_rounds),
+            strategy=strategy,
+            # Ray's GPU autodetection shells out to WMIC, which is absent on
+            # current Windows 11 builds. Declaring num_gpus=0 skips that probe
+            # and matches this project's CPU-only target (SDS Section 6,
+            # Assumption 11). Every other Ray setting is Flower's own default.
+            ray_init_args={
+                "ignore_reinit_error": True,
+                "include_dashboard": False,
+                "num_gpus": 0,
+            },
+        )
+        training_time_seconds = time.time() - start_time
+
+        # ---- Per-round logging + history CSV -----------------------------
+        # Columns are fixed by SDS Section 14.6:
+        # round, aggregated_loss, aggregated_accuracy.
+        losses = dict(history.losses_distributed)
+        accuracies = dict(history.metrics_distributed.get("accuracy", []))
+        history_rows = []
+        for server_round in sorted(losses):
+            aggregated_loss = losses[server_round]
+            aggregated_accuracy = accuracies.get(server_round)
+            history_rows.append(
+                {
+                    "round": server_round,
+                    "aggregated_loss": aggregated_loss,
+                    "aggregated_accuracy": aggregated_accuracy,
+                }
+            )
+            logger.info(
+                "Round %d — aggregated_loss=%.6f aggregated_accuracy=%.6f",
+                server_round,
+                aggregated_loss,
+                aggregated_accuracy,
+            )
+
+        history_df = pandas.DataFrame(history_rows)
+        logger.info(
+            "Simulation complete — rounds_run=%d | total_training_time=%.4f "
+            "seconds",
+            len(history_df),
+            training_time_seconds,
+        )
+
+        # ---- Global-weight capture (mandatory — SDS Section 14.6) --------
+        if strategy.latest_parameters is None:
+            raise RuntimeError(
+                "strategy.latest_parameters is None after the simulation — no "
+                "round aggregated successfully, so no federated global model "
+                "can be built."
+            )
+
+        aggregated_ndarrays = parameters_to_ndarrays(strategy.latest_parameters)
+        global_model = build_cnn_gru(
+            input_shape=(num_features, 1),
+            num_classes=num_classes,
+            model_config=config["model"],
+            training_config=config["training"],
+        )
+        global_model.set_weights(aggregated_ndarrays)
+        logger.info(
+            "Global model rebuilt from strategy.latest_parameters "
+            "(%d weight tensors) — never from a per-client local model.",
+            len(aggregated_ndarrays),
+        )
+
+        global_model_path = os.path.join(
+            models_dir, "federated_global_model.h5"
+        )
+        global_model.save(global_model_path)
+        logger.info(
+            "Saved federated global model to '%s'", global_model_path
+        )
+
+        # ---- Persist model summary and architecture diagram --------------
+        summary_text = get_model_summary_string(global_model)
+        summary_path = os.path.join(models_dir, "federated_model_summary.txt")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            handle.write(summary_text)
+        logger.info("Saved model summary to '%s'", summary_path)
+
+        diagram_path = os.path.join(models_dir, "federated_architecture.png")
+        save_model_architecture_diagram(global_model, diagram_path)
+        if os.path.exists(diagram_path):
+            logger.info("Saved architecture diagram to '%s'", diagram_path)
+        else:
+            logger.warning(
+                "Architecture diagram was not produced at '%s' "
+                "(pydot/graphviz likely unavailable; non-fatal).",
+                diagram_path,
+            )
+
+        # ---- Persist history CSV -----------------------------------------
+        history_csv_path = os.path.join(results_dir, "federated_history.csv")
+        history_df.to_csv(history_csv_path, index=False)
+        logger.info(
+            "Saved federated history (%d rows) to '%s'",
+            len(history_df),
+            history_csv_path,
+        )
+
+        # ---- Persist training time ---------------------------------------
+        training_time_path = os.path.join(
+            results_dir, "federated_training_time.txt"
+        )
+        with open(training_time_path, "w", encoding="utf-8") as handle:
+            handle.write(str(training_time_seconds))
+        logger.info(
+            "Saved training time (%.4f s) to '%s'",
+            training_time_seconds,
+            training_time_path,
+        )
+
+        logger.info("=== run_federated_simulation complete ===")
+
+    except KeyboardInterrupt:
+        # KeyboardInterrupt derives from BaseException, not Exception, so the
+        # handler below would never see it. Logging it explicitly means a
+        # manual Ctrl+C leaves a visible record instead of a log that simply
+        # stops mid-run with no explanation.
+        logger.warning(
+            "run_federated_simulation interrupted by user (KeyboardInterrupt). "
+            "Any artifact logged as saved above is complete and valid on disk."
+        )
+        raise
+    except Exception:
+        logger.error(
+            "run_federated_simulation failed — full traceback:", exc_info=True
+        )
+        raise

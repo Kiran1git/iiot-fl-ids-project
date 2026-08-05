@@ -271,13 +271,19 @@ def test_aggregate_fit_does_not_capture_none(reduced_config):
 
 
 # ---------------------------------------------------------------------------
-# run_federated_simulation stub (body deferred to Phase 10)
+# run_federated_simulation — implemented in Phase 10
 # ---------------------------------------------------------------------------
 
 
-def test_run_federated_simulation_is_stubbed(reduced_config):
-    """Phase 9 defines only the signature; the body lands in Phase 10."""
-    with pytest.raises(NotImplementedError):
+def test_run_federated_simulation_is_implemented(reduced_config):
+    """Phase 10 replaced Phase 9's stub with the full body.
+
+    The function must no longer raise ``NotImplementedError``. It is invoked
+    here with a config whose ``paths`` key is absent, so it fails fast on that
+    missing key *before* touching any file — proving the real body is running
+    without reading the processed CSV or writing any artifact.
+    """
+    with pytest.raises(KeyError):
         run_federated_simulation(reduced_config)
 
 
