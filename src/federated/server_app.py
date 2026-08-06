@@ -35,12 +35,14 @@ Per the SDS Section 11 import graph, ``src/federated/`` imports only from
 or ``src/explainability/``.
 """
 
+import gc
 import json
 import logging
 import os
 import pickle
 import time
 from functools import partial
+
 
 import flwr
 import pandas
@@ -220,7 +222,167 @@ def weighted_average_eval(metrics: list[tuple[int, dict]]) -> dict:
     return {"accuracy": weighted_accuracy}
 
 
+def build_ray_init_args(config: dict) -> dict:
+    """Assemble the ``ray_init_args`` dict for ``start_simulation``.
+
+    Purpose:
+        Ray on Windows backs its object store with a memory-mapped file sized,
+        by default, at roughly 30% of physical RAM. On a 16 GB laptop that is a
+        ~4.8 GB mapping requested up front, and once TensorFlow's four client
+        actors have taken their share, Windows can no longer commit it:
+
+            CreateFileMapping() failed. GetLastError() = 1450
+
+        which is ``ERROR_NO_SYSTEM_RESOURCES`` and kills the raylet mid-run.
+        Capping ``object_store_memory`` keeps that mapping small enough to
+        always succeed.
+
+        When ``federated.ray`` is absent from the config — which is the case
+        for the untouched production ``configs/config.yaml`` — this function
+        returns exactly the settings the project used before, so the
+        FULL_EXPERIMENT path is bit-for-bit unchanged.
+
+    Args:
+        config: The loaded config dict. Reads the optional
+            ``federated.ray`` sub-dict: ``object_store_memory_mb``,
+            ``memory_mb``, ``num_cpus``.
+
+    Returns:
+        dict: Arguments forwarded verbatim to ``ray.init`` by Flower.
+    """
+    # Baseline, identical to the pre-existing production behaviour.
+    # num_gpus=0 skips Ray's GPU autodetection, which shells out to WMIC — a
+    # binary absent from current Windows 11 builds (SDS Section 6,
+    # Assumption 11).
+    ray_init_args = {
+        "ignore_reinit_error": True,
+        "include_dashboard": False,
+        "num_gpus": 0,
+    }
+
+    ray_config = config["federated"].get("ray") or {}
+
+    megabyte = 1024 * 1024
+    if ray_config.get("object_store_memory_mb"):
+        ray_init_args["object_store_memory"] = int(
+            ray_config["object_store_memory_mb"] * megabyte
+        )
+    if ray_config.get("memory_mb"):
+        ray_init_args["_memory"] = int(ray_config["memory_mb"] * megabyte)
+    if ray_config.get("num_cpus"):
+        ray_init_args["num_cpus"] = int(ray_config["num_cpus"])
+
+    return ray_init_args
+
+
+def build_client_resources(config: dict):
+    """Assemble Flower's per-client Ray actor resource request.
+
+    Purpose:
+        Flower derives the number of *concurrent* client actors from this dict:
+
+            concurrent_actors = floor(ray_num_cpus / client_num_cpus)
+
+        Every concurrent actor holds its own TensorFlow runtime (~350-500 MB),
+        its own copy of the CNN-GRU graph, and its own cached feature tensors.
+        Raising ``client_num_cpus`` therefore *lowers* peak RAM by serialising
+        the clients. In LAPTOP_MODE the overlay sets ``num_cpus: 2`` and
+        ``client_num_cpus: 2``, so exactly one client trains at a time.
+
+        This changes nothing mathematically: clients within a FedAvg round are
+        independent, so running them sequentially yields the identical
+        aggregate as running them in parallel.
+
+    Args:
+        config: The loaded config dict. Reads the optional
+            ``federated.client_num_cpus`` / ``federated.client_num_gpus``.
+
+    Returns:
+        dict | None: The ``client_resources`` mapping, or ``None`` to keep
+            Flower's default (1 CPU per client) when the keys are absent — the
+            FULL_EXPERIMENT behaviour.
+    """
+    federated_config = config["federated"]
+
+    if "client_num_cpus" not in federated_config:
+        return None
+
+    return {
+        "num_cpus": float(federated_config["client_num_cpus"]),
+        "num_gpus": float(federated_config.get("client_num_gpus", 0)),
+    }
+
+
+def subsample_for_server_eval(
+    test_data: pandas.DataFrame,
+    config: dict,
+    logger: logging.Logger,
+) -> pandas.DataFrame:
+    """Optionally shrink the server-side centralized evaluation split.
+
+    Purpose:
+        The server-side evaluation tensors stay resident for the whole
+        simulation. At ~443k test rows x 95 features x 4 bytes that is roughly
+        168 MB of float32 held alongside every client actor. In LAPTOP_MODE
+        ``runtime_profile.server_eval_max_rows`` caps that at 50k rows (~19 MB).
+
+        The subsample is stratified on ``label`` and drawn with the project
+        seed, so the accuracy estimate stays representative and reproducible;
+        at 50k rows the sampling error on an accuracy figure is well under
+        +/-0.5%.
+
+        When the key is absent — the FULL_EXPERIMENT case — the full split is
+        returned unchanged.
+
+    Args:
+        test_data: The shared global test split.
+        config: The loaded config dict.
+        logger: Logger used to record whether subsampling occurred.
+
+    Returns:
+        pandas.DataFrame: Either ``test_data`` itself or a stratified sample.
+    """
+    max_rows = (config.get("runtime_profile") or {}).get(
+        "server_eval_max_rows", 0
+    )
+
+    if not max_rows or len(test_data) <= max_rows:
+        logger.info(
+            "Server-side evaluation uses the FULL shared global test split "
+            "(%d rows).",
+            len(test_data),
+        )
+        return test_data
+
+    fraction = max_rows / len(test_data)
+    sampled = (
+        test_data.groupby("label", group_keys=False)
+        .apply(
+            lambda group: group.sample(
+                # At least one row per class, so a rare class is never dropped
+                # from the evaluation entirely.
+                n=max(1, int(round(len(group) * fraction))),
+                random_state=config["seed"],
+            )
+        )
+    )
+    logger.info(
+        "Server-side evaluation uses a stratified subsample of the shared "
+        "global test split: %d of %d rows (runtime_profile."
+        "server_eval_max_rows=%d). Frees roughly %.0f MB for the whole run.",
+        len(sampled),
+        len(test_data),
+        max_rows,
+        (len(test_data) - len(sampled))
+        * len(test_data.columns)
+        * 4
+        / (1024 * 1024),
+    )
+    return sampled
+
+
 def make_server_side_evaluate_fn(
+
     config: dict,
     X_test,
     y_test,
@@ -412,6 +574,9 @@ def run_federated_simulation(
 
         logger.info("=== run_federated_simulation starting ===")
         logger.info(
+            "Run profile: %s", config.get("run_mode", "FULL_EXPERIMENT")
+        )
+        logger.info(
             "Federated config summary — num_clients=%s | num_rounds=%s | "
             "local_epochs=%s | partition_strategy=%s | batch_size=%s",
             num_clients,
@@ -420,6 +585,7 @@ def run_federated_simulation(
             config["federated"]["partition_strategy"],
             config["training"]["batch_size"],
         )
+
 
         # ---- Load processed dataset -------------------------------------
         processed_csv_path = os.path.join(
@@ -497,13 +663,22 @@ def run_federated_simulation(
         # ---- Server-side centralized evaluation --------------------------
         # Built once, outside the timed region, so the tensor construction
         # cost is not attributed to federated training time.
+        #
+        # In LAPTOP_MODE this uses a stratified subsample of the test split,
+        # because these tensors stay resident for the entire simulation and
+        # the full split is ~168 MB of float32. In FULL_EXPERIMENT the split
+        # is returned untouched.
+        server_eval_data = subsample_for_server_eval(
+            test_data_global, config, logger
+        )
         X_test_global, y_test_global = prepare_model_ready_data(
-            test_data_global,
-            test_data_global.index.values,
+            server_eval_data,
+            server_eval_data.index.values,
             feature_columns,
             label_encoder,
             num_classes,
         )
+
         server_evaluate_fn = make_server_side_evaluate_fn(
             config,
             X_test_global,
@@ -516,28 +691,85 @@ def run_federated_simulation(
         # ---- Run the simulation (time.time() wraps ONLY this call) -------
         strategy = get_strategy(config, evaluate_fn=server_evaluate_fn)
 
+        # Ray/actor sizing. In FULL_EXPERIMENT both helpers return the
+        # project's original settings (and client_resources is None, i.e.
+        # Flower's default), so the cloud path is unchanged. In LAPTOP_MODE
+        # they cap the object store and serialise the client actors.
+        ray_init_args = build_ray_init_args(config)
+        client_resources = build_client_resources(config)
+
         logger.info(
-            "Starting Flower simulation — %d clients x %d rounds ...",
+            "Starting Flower simulation — %d clients x %d rounds | "
+            "ray_init_args=%s | client_resources=%s",
             num_clients,
             num_rounds,
+            ray_init_args,
+            client_resources,
         )
+        if client_resources:
+            concurrent = int(
+                ray_init_args.get("num_cpus", os.cpu_count() or 1)
+                // client_resources["num_cpus"]
+            )
+            logger.info(
+                "At most %d client actor(s) will run concurrently — peak RAM "
+                "is driven by this number, not by num_clients.",
+                max(concurrent, 1),
+            )
+
         start_time = time.time()
         history = flwr.simulation.start_simulation(
             client_fn=bound_client_fn,
             num_clients=num_clients,
             config=flwr.server.ServerConfig(num_rounds=num_rounds),
             strategy=strategy,
-            # Ray's GPU autodetection shells out to WMIC, which is absent on
-            # current Windows 11 builds. Declaring num_gpus=0 skips that probe
-            # and matches this project's CPU-only target (SDS Section 6,
-            # Assumption 11). Every other Ray setting is Flower's own default.
-            ray_init_args={
-                "ignore_reinit_error": True,
-                "include_dashboard": False,
-                "num_gpus": 0,
-            },
+            client_resources=client_resources,
+            ray_init_args=ray_init_args,
         )
         training_time_seconds = time.time() - start_time
+
+        # ---- Release the simulation's memory before writing artifacts ----
+        # Ray keeps its actors (and their TensorFlow runtimes, ~350-500 MB
+        # each) alive until shutdown. Saving the .h5, rendering the
+        # architecture diagram, and writing the CSVs all allocate, and on a
+        # 16 GB laptop doing that while the actors are still resident is what
+        # pushes the machine into the CreateFileMapping failure. Shutting Ray
+        # down first is safe here because `history` and
+        # `strategy.latest_parameters` are plain in-process Python objects
+        # that no longer depend on the Ray cluster.
+        if (config.get("runtime_profile") or {}).get(
+            "release_memory_after_rounds", False
+        ):
+            try:
+                import ray
+
+                if ray.is_initialized():
+                    ray.shutdown()
+                    logger.info(
+                        "Ray shut down after the final round — client actors "
+                        "and the object store are released before artifacts "
+                        "are written."
+                    )
+            except Exception:
+                # Never let cleanup failure destroy a completed training run.
+                logger.warning(
+                    "Ray shutdown after the final round failed; continuing to "
+                    "artifact persistence.",
+                    exc_info=True,
+                )
+
+            # The shards and the server-side eval tensors are the largest
+            # remaining objects in the parent process and nothing below needs
+            # them.
+            del client_shards, bound_client_fn
+            del X_test_global, y_test_global
+            collected = gc.collect()
+            logger.info(
+                "Released client shards and server-side evaluation tensors "
+                "(gc collected %d objects).",
+                collected,
+            )
+
 
         # ---- Per-round logging + history CSV -----------------------------
         # Columns are fixed by SDS Section 14.6:

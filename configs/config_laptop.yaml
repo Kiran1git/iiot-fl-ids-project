@@ -1,0 +1,123 @@
+# =============================================================================
+# LAPTOP_MODE overlay — low-resource federated profile
+# =============================================================================
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# On Windows, Ray backs its object store with a memory-mapped file. When the
+# store cannot grow, Windows returns:
+#
+#     CreateFileMapping() failed. GetLastError() = 1450
+#     (ERROR_NO_SYSTEM_RESOURCES)
+#
+# followed by a raylet/worker crash. On this project that reproduces at roughly
+# round 5 of the 4-client x 15-round run, because every additional concurrent
+# Ray actor holds its own TensorFlow runtime, its own copy of the CNN-GRU
+# graph, and its own cached feature tensors — all of which stay resident for
+# the whole simulation.
+#
+# This overlay does NOT redesign anything. It only shrinks the concurrency and
+# the per-actor working set so the whole run fits in 16 GB.
+#
+# HOW TO USE IT
+# -------------
+#   Laptop run :  set IIOT_MODE=LAPTOP_MODE   (or: --mode LAPTOP_MODE)
+#   Cloud run  :  set IIOT_MODE=FULL_EXPERIMENT   (default; ignores this file)
+#
+# The loader deep-merges these keys over configs/config.yaml. Any key NOT
+# listed here keeps its production value, so preprocessing, the CNN-GRU
+# architecture, the evaluation pipeline, and the Flower/FedAvg implementation
+# are all byte-for-byte identical between the two modes.
+# =============================================================================
+
+federated:
+  # 4 -> 2 clients. This is the single largest RAM saving available: Flower's
+  # Ray backend keeps one actor alive per concurrent client, and each actor
+  # carries an independent TensorFlow session (~350-500 MB) plus that client's
+  # cached X_train/X_validation tensors. Halving the client count halves both.
+  num_clients: 2
+
+  # 15 -> 5 rounds. Rounds do not accumulate RAM by themselves, but every round
+  # pushes a fresh parameter blob through the Ray object store, and the store
+  # only reclaims those blobs on GC. Fewer rounds means fewer live objects and
+  # a much shorter window in which fragmentation can trip the 1450 error.
+  num_rounds: 5
+
+  # 2 -> 1 local epoch. Keras allocates its gradient/optimizer-slot tensors per
+  # fit() call; one epoch halves the wall-clock time each actor spends holding
+  # that peak allocation, which lowers the probability that two actors hit
+  # their peak simultaneously.
+  local_epochs: 1
+
+  # Unchanged in meaning, only re-stated so the strategy thresholds match the
+  # reduced client count (get_strategy pins all three to num_clients anyway).
+  min_available_clients: 2
+  min_fit_clients: 2
+  min_evaluate_clients: 2
+
+  # Unchanged from production — the local validation split is a correctness
+  # feature, not a cost. Kept explicit so the two configs read the same.
+  client_val_split: 0.2
+
+  # ---- Ray resource governor (LAPTOP_MODE only) ---------------------------
+  # Consumed by run_federated_simulation. Absent from configs/config.yaml, in
+  # which case Flower's own defaults apply and nothing changes for the cloud
+  # run.
+  ray:
+    # Object-store cap. Ray otherwise sizes the store at ~30% of total RAM
+    # (~4.8 GB here) and reserves it up front via CreateFileMapping — which is
+    # precisely the call that fails. Pinning it to 1 GB keeps the mapping small
+    # enough that Windows can always satisfy it.
+    object_store_memory_mb: 1024
+
+    # Total RAM Ray believes it may use for scheduling decisions. Setting it
+    # below the physical 16 GB leaves headroom for the parent process, which
+    # still holds the full processed DataFrame and the server-side test
+    # tensors.
+    memory_mb: 6144
+
+    # Logical CPU budget shared by all actors.
+    num_cpus: 2
+
+  # ---- Per-client Ray actor resources ------------------------------------
+  # Flower multiplies this out to decide how many clients may run at once:
+  #   concurrent_actors = floor(ray.num_cpus / client_num_cpus)
+  # With num_cpus=2 and client_num_cpus=2, exactly ONE client trains at a time.
+  # Serialising the clients is the key change: peak RAM becomes
+  #   parent + 1 actor
+  # instead of
+  #   parent + 4 actors
+  # FedAvg is mathematically unaffected — clients in a round are independent,
+  # so running them one after another produces the identical aggregate.
+  client_num_cpus: 2
+  client_num_gpus: 0
+
+training:
+  # 64 -> 32. Activation memory for the Conv1D/GRU stack scales linearly with
+  # batch size; 32 halves the largest transient allocation inside each actor.
+  # Smaller batches also mean more gradient updates per epoch, which partly
+  # compensates for dropping to a single local epoch.
+  batch_size: 32
+
+  # Unchanged — class weighting is a correctness feature and costs one float
+  # per class.
+  use_class_weights: true
+
+# ---- Laptop-mode runtime switches ----------------------------------------
+runtime_profile:
+  name: "LAPTOP_MODE"
+
+  # Drop each client's cached tensors as soon as the simulation ends and force
+  # a GC + Ray shutdown between the simulation and the artifact-saving stage,
+  # so model.save() is not competing with the actors' residual memory.
+  release_memory_after_rounds: true
+
+  # Subsample the shared global test split used by the SERVER-SIDE centralized
+  # evaluation. The full split is ~443k rows x 95 features x 4 bytes ~= 168 MB
+  # as a float32 tensor, and it is resident for the whole simulation. 50k rows
+  # (~19 MB) gives a test-accuracy estimate accurate to well under +/-0.5% while
+  # freeing ~150 MB.
+  #
+  # Set to 0 (or omit) to evaluate on the full split, which is what
+  # FULL_EXPERIMENT does.
+  server_eval_max_rows: 50000
