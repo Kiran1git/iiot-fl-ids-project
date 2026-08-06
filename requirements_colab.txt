@@ -1,0 +1,220 @@
+# =============================================================================
+# Google Colab / Python 3.12 dependency set — SDS DEVIATION, NOT THE DEFAULT
+# =============================================================================
+#
+# STATUS: This file is an ADDITIVE alternative to requirements.txt. It is NOT
+# the project's authoritative dependency set. requirements.txt remains the
+# authoritative, SDS-frozen stack (SDS Section 7) and is unmodified.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# requirements.txt cannot be installed on Google Colab's current runtime:
+#
+#   * Colab now ships Python 3.12.
+#   * tensorflow==2.15.1 publishes no cp312 wheels — the pinned TF cannot be
+#     installed on Python 3.12 by any means (there is no fallback sdist that
+#     builds in a reasonable time on Colab).
+#
+# This file is therefore the minimum-deviation set that installs and runs on
+# that runtime.
+#
+# EXPLICIT SDS DEVIATIONS (accepted by project owner, decision recorded here)
+# --------------------------------------------------------------------------
+# Using this file knowingly violates two frozen constraints:
+#
+#   1. SDS Section 7 / Section 22: "Do not upgrade tensorflow, flwr, ray, or
+#      shap beyond the exact versions pinned in Section 7." TensorFlow is
+#      upgraded below out of hard platform necessity.
+#
+#   2. SDS Section 7's stated reason for the TF pin — "last release with Keras 2
+#      as default; required for shap.GradientExplainer compatibility." TF >= 2.16
+#      defaults to Keras 3. This is mitigated (not eliminated) by the
+#      tf-keras + TF_USE_LEGACY_KERAS pin below; see "KERAS 2 COMPATIBILITY".
+#
+# What is NOT deviated from: flwr==1.8.0 and its start_simulation API are held
+# exactly. SDS Section 5 declares the app-based
+# run_simulation/ClientApp/ServerApp API permanently forbidden project-wide, and
+# Section 14.6 pins start_simulation. Consequently NO code change is required in
+# src/federated/ — see "FLOWER API: NO CODE CHANGES REQUIRED" below.
+#
+# USAGE
+# -----
+#   !pip install -r requirements_colab.txt
+#   # then RESTART THE RUNTIME before importing tensorflow (mandatory — see below)
+#
+# Before any project import, in the first cell of the notebook:
+#   import os
+#   os.environ["TF_USE_LEGACY_KERAS"] = "1"
+#
+# =============================================================================
+
+
+# --- Core DL runtime ---------------------------------------------------------
+# 2.17.x is the newest TF line that still ships an official cp312 wheel while
+# remaining on the TF 2.x graph/SavedModel semantics this project's .h5 models
+# and build_cnn_gru rely on. Chosen over 2.19/2.20 to stay as close to the
+# pinned 2.15.1 behaviour as the platform allows.
+tensorflow==2.17.1
+
+# KERAS 2 COMPATIBILITY (load-bearing — do not remove either line)
+# TF >= 2.16 makes Keras 3 the default `tf.keras`. shap==0.4x's
+# GradientExplainer walks Keras 2 internals and breaks against Keras 3.
+# tf-keras restores the Keras 2 implementation, and the environment variable
+# TF_USE_LEGACY_KERAS=1 makes `tf.keras` resolve to it. BOTH are required:
+# installing tf-keras without setting the variable changes nothing.
+tf-keras==2.17.0
+
+# --- Federated learning ------------------------------------------------------
+# HELD AT THE SDS PIN. flwr 1.8.0's start_simulation(client_fn=..., ...) API is
+# what src/federated/server_app.py calls, and it is Python 3.12-compatible
+# (pure Python, no compiled extension). Do NOT bump this: start_simulation was
+# removed in Flower 1.13+, which would force the SDS-forbidden app-based API and
+# a rewrite of both server_app.py and client_app.py.
+flwr[simulation]==1.8.0
+
+# Ray backs flwr[simulation]'s VirtualClientEngine. ray==2.6.3 (the SDS pin) has
+# no cp312 wheel, so it is raised to the lowest release that does. 2.31.0 is
+# still within the 2.x actor/resource API surface that flwr 1.8.0's
+# start_simulation drives via ray_init_args and client_resources, so
+# build_ray_init_args() and build_client_resources() in server_app.py keep
+# working unmodified.
+ray==2.31.0
+
+# --- Numerics ----------------------------------------------------------------
+# NumPy 2.x is a hard conflict here: tensorflow 2.17 and shap 0.4x are both
+# built against the NumPy 1.x C ABI, and ray 2.31 likewise. The <2.0 ceiling is
+# the single most important constraint in this file — relaxing it produces
+# "_ARRAY_API not found" / "compiled using NumPy 1.x cannot be run in NumPy 2.x"
+# at import time. Colab preinstalls NumPy 2.x, which is exactly why the runtime
+# restart after install is mandatory.
+numpy>=1.26,<2.0
+
+# protobuf: the tightest simultaneous constraint in the whole set. TF 2.17
+# requires >=3.20.3,<5.0, ray 2.31 requires >=3.15.3, and flwr 1.8.0 requires
+# >=3.19,<5.0 (via grpcio-tools). 4.25.x is the only line satisfying all three
+# with cp312 wheels. Colab preinstalls protobuf 5.x for its own packages, so
+# this WILL be downgraded on install — that downgrade is intended, and is the
+# second reason the runtime restart is mandatory.
+protobuf>=4.25.3,<5.0
+
+# --- Explainability ----------------------------------------------------------
+# Raised from the SDS's 0.44.1 (no cp312 wheel) to the lowest release providing
+# one. 0.46.0 keeps the GradientExplainer API that
+# src/explainability/shap_utils.py calls — explainer.shap_values(...) and
+# shap.summary_plot(...) are unchanged, so the mandatory four-step squeeze in
+# generate_shap_explanations() still applies exactly as written.
+shap==0.46.0
+
+# --- Classical ML / data -----------------------------------------------------
+# scikit-learn raised from the SDS's <1.5 ceiling for cp312 wheel availability.
+# Only LabelEncoder, train_test_split, compute_class_weight and the sklearn.metrics
+# functions are used; all are API-stable across this range.
+scikit-learn>=1.5,<1.7
+pandas>=2.2,<2.3
+pyarrow>=14.0            # read_processed() reads .parquet; not implied by pandas
+
+# --- Visualization / app -----------------------------------------------------
+matplotlib>=3.8,<3.10
+streamlit>=1.37,<1.40
+
+# --- Config / test -----------------------------------------------------------
+pyyaml>=6.0
+pytest>=7.4
+
+
+# =============================================================================
+# FLOWER API: NO CODE CHANGES REQUIRED
+# =============================================================================
+#
+# You asked me to explain any code changes needed if newer Flower APIs are
+# required. The answer is that none are needed, and this is deliberate.
+#
+# flwr is held at the SDS-pinned 1.8.0 above, so every Flower call site in the
+# project is untouched:
+#
+#   * src/federated/server_app.py — flwr.simulation.start_simulation(
+#         client_fn=..., num_clients=..., config=flwr.server.ServerConfig(...),
+#         strategy=..., client_resources=..., ray_init_args=...)
+#   * src/federated/client_app.py — FLClient(NumPyClient) and
+#         client_fn(cid) -> client.to_client()
+#   * SavingFedAvg(FedAvg), weighted_average_fit / weighted_average_eval,
+#         flwr.common.parameters_to_ndarrays
+#   * tests/test_federated_loop.py — drives the same start_simulation API
+#
+# For the record, had Flower been upgraded to >= 1.13 (where start_simulation is
+# removed), these changes would have been forced — all of them SDS violations:
+#
+#   1. server_app.py: start_simulation(...) -> flwr.simulation.run_simulation(
+#        server_app=ServerApp(...), client_app=ClientApp(...),
+#        num_supernodes=...). Directly violates SDS Section 5 and Section 14.6.
+#   2. client_app.py: client_fn's signature changes from client_fn(cid: str) to
+#        client_fn(context: Context), with the client ID read from
+#        context.node_config["partition-id"] instead of the cid argument. The
+#        functools.partial binding of client_shards/test_data/config in
+#        run_federated_simulation would have to be reworked into a Context-based
+#        mechanism.
+#   3. ray_init_args / client_resources: replaced by backend_config=
+#        {"client_resources": {...}, "init_args": {...}}, so
+#        build_ray_init_args() and build_client_resources() would both need
+#        rewriting.
+#   4. The History object's losses_distributed / metrics_distributed /
+#        losses_centralized / metrics_centralized accessors that
+#        run_federated_simulation reads to build federated_history.csv would
+#        need re-verification against the new API.
+#
+# None of the above is implemented, because flwr stays at 1.8.0.
+#
+#
+# =============================================================================
+# COLAB SETUP — REQUIRED ORDER
+# =============================================================================
+#
+# Cell 1 — install, then restart:
+#     !pip install -r requirements_colab.txt
+#     # Colab preinstalls numpy 2.x and protobuf 5.x. The install above
+#     # downgrades both. The already-imported modules in the live session are
+#     # stale until the runtime is restarted, so:
+#     import os; os.kill(os.getpid(), 9)        # forces runtime restart
+#
+# Cell 2 — AFTER the restart, BEFORE importing anything from src/:
+#     import os
+#     os.environ["TF_USE_LEGACY_KERAS"] = "1"   # must precede `import tensorflow`
+#
+#     import tensorflow as tf
+#     assert tf.keras.__name__.startswith("tf_keras"), (
+#         "Keras 3 is active — GradientExplainer will fail. "
+#         "Set TF_USE_LEGACY_KERAS=1 before importing tensorflow."
+#     )
+#
+# Cell 3 — verify the constraint set actually resolved:
+#     import numpy, google.protobuf, flwr, ray, shap
+#     assert numpy.__version__.startswith("1."), numpy.__version__
+#     print(numpy.__version__, google.protobuf.__version__,
+#           flwr.__version__, ray.__version__, shap.__version__)
+#
+#
+# =============================================================================
+# KNOWN RISKS UNDER THIS FILE
+# =============================================================================
+#
+# 1. Keras 3 leakage. If TF_USE_LEGACY_KERAS=1 is not set before the first
+#    `import tensorflow`, tf.keras resolves to Keras 3 and
+#    shap.GradientExplainer fails inside generate_shap_explanations(). The
+#    assert in Cell 2 exists to catch this immediately rather than 40 minutes
+#    into a run.
+#
+# 2. .h5 model portability. Models written by the frozen TF 2.15.1 stack load
+#    under TF 2.17 + tf-keras, but models written under this file should not be
+#    assumed loadable by the 2.15.1 stack. Do not mix artifacts across the two
+#    environments — regenerate within whichever environment you are using.
+#
+# 3. Numerical non-identity. Different TF/CUDA builds change floating-point
+#    reduction order, so results from this file will not be bit-identical to the
+#    frozen stack even at the same seed. SDS Section 23's reproducibility
+#    criteria are defined against requirements.txt, not this file.
+#
+# 4. Verification status. This constraint set is derived from published wheel
+#    availability and each package's declared dependency metadata. It has NOT
+#    been executed on a Colab runtime from this workspace — validate with Cell 3
+#    above on first use.
+# =============================================================================
