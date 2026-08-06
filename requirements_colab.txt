@@ -70,7 +70,7 @@ tf-keras==2.17.0
 # (pure Python, no compiled extension). Do NOT bump this: start_simulation was
 # removed in Flower 1.13+, which would force the SDS-forbidden app-based API and
 # a rewrite of both server_app.py and client_app.py.
-flwr[simulation]==1.8.0
+flwr==1.8.0
 
 # Ray backs flwr[simulation]'s VirtualClientEngine. ray==2.6.3 (the SDS pin) has
 # no cp312 wheel, so it is raised to the lowest release that does. 2.31.0 is
