@@ -76,7 +76,7 @@ training:
   optimizer: "adam"   # documentation-only; Adam is the only implemented optimizer (Section 6)
   learning_rate: 0.001
   loss: "categorical_crossentropy"
-  batch_size: 64
+  batch_size: 128
   centralized_epochs: 10
   validation_split: 0.2
   early_stopping_patience: 3
@@ -88,13 +88,13 @@ training:
   use_class_weights: true
 
 federated:
-  num_clients: 4
-  num_rounds: 15
-  local_epochs: 2
+  num_clients: 2
+  num_rounds: 5
+  local_epochs: 1
   partition_strategy: "iid"
-  min_available_clients: 4
-  min_fit_clients: 4
-  min_evaluate_clients: 4
+  min_available_clients: 2
+  min_fit_clients: 2
+  min_evaluate_clients: 2
   # Fraction of each client's own shard held out as a LOCAL validation split.
   # FLClient.evaluate reports on this local split, so weighted_average_eval
   # aggregates four genuinely different numbers instead of four copies of the
