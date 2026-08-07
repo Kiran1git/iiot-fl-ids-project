@@ -146,11 +146,9 @@ def generate_shap_explanations(
         explainer = shap.GradientExplainer(model, background)
         shap_values = explainer.shap_values(test_samples)
 
-        # GradientExplainer returns a list (one array per class) for
-        # multi-class output; normalise the single-output case to that shape so
-        # the squeeze and aggregation steps below are uniform.
-        if not isinstance(shap_values, list):
-            shap_values = [shap_values]
+        # SHAP compatibility:
+        # Older SHAP returns a list of arrays.
+        # Newer SHAP returns a single ndarray.
 
         log.info(
             "SHAP values computed — %d per-class arrays, each %s",
@@ -158,13 +156,25 @@ def generate_shap_explanations(
             np.asarray(shap_values[0]).shape,
         )
 
-        # ---- Mandatory squeeze (SDS §14.10, steps 1-2) -------------------
-        # Skipping this is the documented shape-mismatch failure inside SHAP's
-        # plotting internals, not a cosmetic detail.
-        shap_values_2d = [
-            np.asarray(sv).squeeze(axis=-1) for sv in shap_values
-        ]
+        # ---- Normalize SHAP output -------------------------------------
+        if isinstance(shap_values, list):
+            shap_values_2d = [
+                np.asarray(sv).squeeze(axis=-1)
+                for sv in shap_values
+            ]
+        else:
+            shap_values = np.asarray(shap_values)
+
+            if shap_values.ndim == 4:
+                shap_values = shap_values.squeeze(axis=2)
+
+            shap_values_2d = [
+                shap_values[:, :, i]
+                for i in range(shap_values.shape[-1])
+            ]
+
         test_samples_2d = test_samples.squeeze(axis=-1)
+
 
         log.info(
             "Squeezed for plotting — shap_values_2d[0]=%s | test_samples_2d=%s",

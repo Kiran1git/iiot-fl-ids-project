@@ -103,7 +103,13 @@ def evaluate_model_on_test_set(
         )
 
     log.info("Loading model for evaluation: '%s'", model_path)
-    model = tensorflow.keras.models.load_model(model_path)
+    model = tensorflow.keras.models.load_model(model_path, compile=False)
+
+    model.compile(
+        optimizer="adam",
+        loss="categorical_crossentropy",
+        metrics=["accuracy"],
+    )
 
     # Loss is always sourced here, from model.evaluate(), and never
     # recomputed independently anywhere downstream (SDS §14.9).
@@ -258,7 +264,13 @@ def generate_model_size_comparison(
         ("Centralized", centralized_model_path),
         ("Federated", federated_model_path),
     ):
-        model = tensorflow.keras.models.load_model(path)
+        model = tensorflow.keras.models.load_model(path, compile=False)
+
+        model.compile(
+            optimizer="adam",
+            loss="categorical_crossentropy",
+            metrics=["accuracy"],
+        )
         rows.append(
             {
                 "Model": name,
