@@ -1,5 +1,5 @@
 # Software Design Specification
-## Revision 2.1
+## Revision 2.2
 ## Privacy-Preserving Federated Intrusion Detection System for Simulated Industrial IoT (CNN-GRU)
 
 **Status:** DESIGN FROZEN — IMPLEMENTATION READY
@@ -18,7 +18,7 @@
 | Base reference | Bhavsar et al., "FL-IDS: Federated Learning-Based Intrusion Detection System Using Edge Devices for Transportation IoT," IEEE Access, 2024 |
 | Mode | Simulation-only (no physical hardware, no Docker) |
 | Architecture status | LOCKED — CNN-GRU, Flower, FedAvg, Edge-IIoTset, SHAP, Streamlit are final |
-| Revision | 2.1 — supersedes Revision 2.0. All inconsistencies identified during the Revision 2.0 architecture consistency audit are resolved in place. This is the single authoritative specification. |
+| Revision | 2.2 — supersedes Revision 2.1. **HUMAN-AUTHORIZED REVISION.** The production federated configuration is changed from 4 clients / 15 rounds to **2 clients / 5 rounds / 2 local epochs**, applied consistently across Sections 8, 14.3, 14.5, 14.6, 19, 21 (Milestone 7), 22, and 23, so that the specification matches the federated run the project actually executed. Nothing else changes: architecture, seed, dataset, preprocessing, evaluation logic, SHAP logic, dashboard requirements, output filenames, and function contracts are all carried forward unaltered from Revision 2.1. The Phase 9 / Section 19 reduced smoke-test configuration remains independently defined and is unaffected. Revision 2.1 superseded Revision 2.0, resolving in place all inconsistencies identified during the Revision 2.0 architecture consistency audit. This is the single authoritative specification. |
 
 ---
 
@@ -26,7 +26,7 @@
 
 Build a simulation-only Industrial IoT intrusion detection system that:
 1. Trains a single, shared **CNN-GRU** architecture to perform **multi-class** classification of IIoT network traffic (Normal + attack categories).
-2. Trains this architecture two ways: (a) **Federated Learning** via Flower's Simulation Engine with **FedAvg** across 4 virtual clients holding an **IID** partition of the data, and (b) **Centralized Learning** on the full dataset, as a comparison baseline.
+2. Trains this architecture two ways: (a) **Federated Learning** via Flower's Simulation Engine with **FedAvg** across 2 virtual clients holding an **IID** partition of the data, and (b) **Centralized Learning** on the full dataset, as a comparison baseline.
 3. Produces a rigorous, side-by-side **Federated vs. Centralized** performance comparison.
 4. Explains model predictions using **SHAP**.
 5. Presents all results through a **read-only Streamlit dashboard** that performs no training.
@@ -152,11 +152,11 @@ If asked to extend this project in any of the above directions, the implementing
 | Centralized validation split | 0.2 (carved by Keras from the end of the training array passed to `.fit()`) | `training.validation_split` |
 | Early stopping (centralized only) | `EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)` | `training.early_stopping_patience` |
 | FL local epochs per round | 2 | `federated.local_epochs` |
-| FL communication rounds | 15 | `federated.num_rounds` |
-| Number of virtual clients | 4 | `federated.num_clients` |
+| FL communication rounds | 5 | `federated.num_rounds` |
+| Number of virtual clients | 2 | `federated.num_clients` |
 | Client data split | IID, equal-size, seeded random partition of the **training split only** (see Section 14.3) | `federated.partition_strategy = "iid"` |
-| Client evaluation data | The single shared global test split (identical across all 4 clients — never partitioned per client; see Section 14.3) | N/A (fixed) |
-| FL strategy | Custom `SavingFedAvg` subclass of `flwr.server.strategy.FedAvg` (Section 14.6), `min_available_clients = min_fit_clients = min_evaluate_clients = 4` in the production run (see Section 19 for the reduced-client smoke-test exception) | `federated.min_clients` |
+| Client evaluation data | The single shared global test split (identical across all 2 clients — never partitioned per client; see Section 14.3) | N/A (fixed) |
+| FL strategy | Custom `SavingFedAvg` subclass of `flwr.server.strategy.FedAvg` (Section 14.6), `min_available_clients = min_fit_clients = min_evaluate_clients = 2` in the production run (see Section 19 for the smoke-test exception, which is independently constructed) | `federated.min_clients` |
 | Batch size | 64 (both centralized and federated local training) | `training.batch_size` |
 | Train/test split | 80/20, stratified by multi-class label, performed **before** any encoder/scaler is fit (Section 14.2) | `dataset.test_size = 0.2` |
 | SHAP explainer | `shap.GradientExplainer` | `explainability.method` |

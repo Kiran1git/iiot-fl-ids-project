@@ -277,3 +277,95 @@ def explain_single_prediction(
     # Same squeeze as the plotting path, so the dashboard never has to know
     # about the trailing channel dimension.
     return [np.asarray(sv).squeeze(axis=-1) for sv in shap_values]
+
+
+def get_top_feature_contributions(
+    shap_values: list,
+    sample: np.ndarray,
+    feature_names: list,
+    predicted_class_index: int,
+    top_n: int = 15,
+) -> "list":
+    """Rank the features that drove one prediction, for the class predicted.
+
+    Purpose:
+        Turn the raw per-class SHAP output into the table the dashboard shows
+        under "Why did the model make this prediction?".
+
+        The ranking is taken from the row of ``shap_values`` belonging to the
+        **predicted class**, not the mean across all classes. The distinction
+        matters: a mean-across-classes ranking answers "which features does
+        this model generally react to here", whereas the question actually
+        being asked is "why *this* class". Only the predicted class's row
+        carries signed evidence for the answer that was given — positive values
+        pushed the model toward that class, negative values pushed against it,
+        and averaging absolute values across 15 classes destroys exactly that
+        sign information.
+
+        Rows are ordered by absolute contribution so the strongest evidence
+        appears first regardless of direction, while the signed value is
+        preserved for display.
+
+    Args:
+        shap_values: The per-class list returned by
+            :func:`explain_single_prediction`, each entry shaped
+            ``(1, num_features)``.
+        sample: The single model input that was explained, shape
+            ``(1, num_features, 1)`` — the same array that was predicted on.
+        feature_names: Ordered feature names from ``feature_names.pkl``.
+        predicted_class_index: Index of the class the model predicted, used to
+            select which per-class SHAP row explains the answer.
+        top_n: Number of features to return.
+
+    Returns:
+        list[dict]: ``top_n`` dicts, ordered by descending absolute
+            contribution, each with ``feature``, ``feature_value``,
+            ``shap_value``, ``abs_shap_value`` and ``direction``
+            (``"increases"`` / ``"decreases"``).
+
+    Raises:
+        IndexError: If ``predicted_class_index`` is outside ``shap_values``.
+        ValueError: If the SHAP row and ``feature_names`` disagree in length,
+            which would mean the explanation is misaligned with the features it
+            claims to name.
+
+    Dependencies:
+        numpy.
+    """
+    if predicted_class_index < 0 or predicted_class_index >= len(shap_values):
+        raise IndexError(
+            f"predicted_class_index {predicted_class_index} is outside the "
+            f"{len(shap_values)} per-class SHAP arrays returned."
+        )
+
+    # Signed contributions for the predicted class only.
+    class_contributions = np.asarray(
+        shap_values[predicted_class_index]
+    ).reshape(-1)
+
+    if len(class_contributions) != len(feature_names):
+        raise ValueError(
+            f"SHAP values describe {len(class_contributions)} feature(s) but "
+            f"{len(feature_names)} feature name(s) were supplied; the "
+            f"explanation would be mislabelled."
+        )
+
+    feature_values = np.asarray(sample).reshape(-1)
+
+    absolute = np.abs(class_contributions)
+    order = np.argsort(absolute)[::-1][: min(top_n, len(absolute))]
+
+    return [
+        {
+            "feature": feature_names[int(position)],
+            "feature_value": float(feature_values[int(position)]),
+            "shap_value": float(class_contributions[int(position)]),
+            "abs_shap_value": float(absolute[int(position)]),
+            "direction": (
+                "increases"
+                if class_contributions[int(position)] >= 0
+                else "decreases"
+            ),
+        }
+        for position in order
+    ]

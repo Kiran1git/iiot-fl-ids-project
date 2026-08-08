@@ -497,6 +497,51 @@ def split_train_test(
 # 6. prepare_model_ready_data
 # ---------------------------------------------------------------------------
 
+def prepare_model_features(
+    df: pd.DataFrame,
+    indices: np.ndarray,
+    feature_columns: list,
+) -> np.ndarray:
+    """Build the CNN-GRU feature tensor for a row subset, without labels.
+
+    Purpose:
+        The feature half of ``prepare_model_ready_data``, factored out so the
+        reshape lives in exactly one place. ``prepare_model_ready_data`` calls
+        this function to produce its ``X``, and the user-facing inference path
+        (``src/inference/predict.py``) calls it directly — user-supplied
+        traffic carries no ``label`` column, so it cannot go through the
+        labelled variant, and a second reshape implementation is precisely what
+        SDS §14.2 forbids.
+
+    Args:
+        df: The fully processed (encoded, scaled) DataFrame, or a row-subset.
+        indices: Array of row indices into ``df`` selecting the subset to use.
+        feature_columns: Ordered list of feature column names, sourced from
+            ``feature_names.pkl`` (the fixed, persisted order).
+
+    Returns:
+        numpy.ndarray: Shape ``(len(indices), len(feature_columns), 1)`` — the
+            feature tensor reshaped for ``Conv1D`` input.
+
+    Raises:
+        KeyError: If any name in ``feature_columns`` is absent from ``df``.
+
+    Dependencies:
+        numpy, pandas.
+    """
+    # float32, not the pandas float64 default. Keras casts to float32 on the
+    # way into the graph regardless, so building the tensor as float64 first
+    # allocates exactly twice the RAM needed and then throws half of it away.
+    # For the centralized training split (1.55M rows x ~95 features) this is
+    # the difference between ~1.2 GB and ~590 MB, and the federated path pays
+    # it once per Ray actor.
+    return (
+        df.loc[indices, feature_columns]
+        .to_numpy(dtype=np.float32, copy=False)
+        .reshape(-1, len(feature_columns), 1)
+    )
+
+
 def prepare_model_ready_data(
     df: pd.DataFrame,
     indices: np.ndarray,
@@ -537,17 +582,9 @@ def prepare_model_ready_data(
     Dependencies:
         numpy, tensorflow.keras.utils.to_categorical.
     """
-    # float32, not the pandas float64 default. Keras casts to float32 on the
-    # way into the graph regardless, so building the tensor as float64 first
-    # allocates exactly twice the RAM needed and then throws half of it away.
-    # For the centralized training split (1.55M rows x ~95 features) this is
-    # the difference between ~1.2 GB and ~590 MB, and the federated path pays
-    # it once per Ray actor.
-    X = (
-        df.loc[indices, feature_columns]
-        .to_numpy(dtype=np.float32, copy=False)
-        .reshape(-1, len(feature_columns), 1)
-    )
+    # The reshape itself lives in prepare_model_features, so the labelled and
+    # unlabelled paths cannot drift apart.
+    X = prepare_model_features(df, indices, feature_columns)
     y_int = label_encoder.transform(df.loc[indices, "label"])
     y = to_categorical(y_int, num_classes=num_classes).astype(np.float32)
     return X, y
