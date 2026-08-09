@@ -61,11 +61,9 @@ def evaluate_model_on_test_set(
 ) -> dict:
     """Load a trained model and evaluate it on the shared held-out test set.
 
-    Purpose:
-        Measure both accuracy metrics and timing metrics for one model, using
-        the exact computation fixed by SDS Section 14.9 — no alternative
-        method is permitted.  Called once per model by
-        ``run_evaluation_pipeline``.
+    Measures accuracy and timing metrics for one model using the exact
+    computation fixed by SDS Section 14.9; no alternative method is permitted.
+    Called once per model by ``run_evaluation_pipeline``.
 
     Args:
         model_path: Path to the ``.h5`` model file
@@ -88,10 +86,6 @@ def evaluate_model_on_test_set(
 
     Raises:
         FileNotFoundError: If ``model_path`` does not exist.
-
-    Dependencies:
-        tensorflow.keras.models.load_model,
-        src.evaluation.metrics.compute_all_metrics, time, os, numpy.
     """
     log = logger or _logger
 
@@ -173,9 +167,8 @@ def generate_comparison_table(
 ) -> pd.DataFrame:
     """Build and persist the final side-by-side comparison table.
 
-    Purpose:
-        Own ``outputs/results/comparison_table.csv`` — the artifact that
-        answers the project's primary research question (SDS Section 1).
+    Owns ``outputs/results/comparison_table.csv`` — the artifact that answers
+    the project's primary research question (SDS Section 1).
 
     Args:
         centralized_metrics: Result of ``evaluate_model_on_test_set`` for
@@ -190,12 +183,6 @@ def generate_comparison_table(
 
     Returns:
         pandas.DataFrame: The two-row comparison table, also saved to disk.
-
-    Raises:
-        Nothing under normal operation.
-
-    Dependencies:
-        pandas.
     """
     def _row(name: str, metrics: dict, training_time: float) -> dict:
         return {
@@ -236,9 +223,8 @@ def generate_model_size_comparison(
 ) -> pd.DataFrame:
     """Compare on-disk size and parameter count of the two models.
 
-    Purpose:
-        Own ``outputs/results/model_size_comparison.csv`` (SDS Section 9/24).
-        Both models are loaded solely to call ``count_params()``.
+    Owns ``outputs/results/model_size_comparison.csv`` (SDS Section 9/24).
+    Both models are loaded solely to call ``count_params()``.
 
     Args:
         centralized_model_path: Path to ``centralized_best_model.h5``.
@@ -251,9 +237,6 @@ def generate_model_size_comparison(
 
     Raises:
         FileNotFoundError: If either model path does not exist.
-
-    Dependencies:
-        tensorflow.keras.models.load_model, pandas, os.
     """
     for path in (centralized_model_path, federated_model_path):
         if not os.path.exists(path):
@@ -292,8 +275,7 @@ def generate_convergence_plot(
 ) -> None:
     """Overlay federated per-round accuracy with centralized per-epoch accuracy.
 
-    Purpose:
-        Own ``outputs/results/convergence_plot.png`` (SDS Section 17).
+    Owns ``outputs/results/convergence_plot.png`` (SDS Section 17).
 
     Args:
         federated_history_path: Path to
@@ -305,14 +287,8 @@ def generate_convergence_plot(
             ``outputs/results/centralized_history.csv``.
         output_path: Path where the PNG is written.
 
-    Returns:
-        None
-
     Raises:
         FileNotFoundError: If either history CSV is missing.
-
-    Dependencies:
-        pandas, matplotlib.
     """
     for path in (federated_history_path, centralized_history_path):
         if not os.path.exists(path):
@@ -393,28 +369,19 @@ def run_evaluation_pipeline(
 ) -> None:
     """Orchestrate the entire evaluation stage.
 
-    Purpose:
-        The single top-level entry point for evaluation, called by
-        ``experiments/run_evaluation.py``.  Executes the fixed 13-step sequence
-        of SDS Section 14.9, producing every evaluation-stage deliverable in
-        SDS Sections 9/17/24.
+    The single top-level entry point for evaluation, called by
+    ``experiments/run_evaluation.py``. Executes the fixed 13-step sequence of
+    SDS Section 14.9, producing every evaluation-stage deliverable in SDS
+    Sections 9/17/24.
 
     Args:
         config: The fully merged configuration dict from ``load_config``.
         logger: Optional logger injected by the orchestrator.  Falls back to
             this module's logger when omitted.
 
-    Returns:
-        None
-
     Raises:
         Propagates any exception raised by the functions it calls, after
         logging at ERROR level.
-
-    Dependencies:
-        All functions in this file, src.evaluation.metrics,
-        src.preprocessing.encode_normalize.prepare_model_ready_data,
-        src.utils.dataio.read_processed, src.utils.logger, src.utils.seed.
     """
     log = logger or _logger
 

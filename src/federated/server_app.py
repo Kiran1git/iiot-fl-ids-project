@@ -1,38 +1,25 @@
 """Federated server, strategy, and simulation wiring.
 
-This module owns the project's single federated aggregation strategy and its
-two distinct metrics-aggregation functions (SDS Section 14.6).
+Owns the project's single federated aggregation strategy and its two distinct
+metrics-aggregation functions (SDS Section 14.6).
 
 Ownership and reuse rules:
-  - ``SavingFedAvg`` is the **sole** strategy class. A plain
-    ``flwr.server.strategy.FedAvg`` must never be instantiated directly for
-    production use anywhere, because a stock ``FedAvg`` does not expose the
-    final round's aggregated parameters after the simulation ends.
+  - ``SavingFedAvg`` is the **sole** strategy class. A stock
+    ``flwr.server.strategy.FedAvg`` must never be used in production, because
+    it does not expose the final round's aggregated parameters after the
+    simulation ends.
   - ``weighted_average_fit`` and ``weighted_average_eval`` are **two distinct
-    functions** and must never be collapsed into one. ``weighted_average_fit``
-    reads both ``loss`` and ``accuracy`` (the keys ``FLClient.fit`` always
-    returns); ``weighted_average_eval`` reads only ``accuracy`` (the single key
-    ``FLClient.evaluate`` returns). Their assignment to
-    ``fit_metrics_aggregation_fn`` vs. ``evaluate_metrics_aggregation_fn`` must
-    never be swapped (SDS Section 14.6, Section 22).
-  - The pinned Flower API is ``flwr==1.8.0``'s
-    client-function/strategy-based ``start_simulation``. The newer app-based
-    ``flwr.simulation.run_simulation(server_app=..., client_app=...,
-    num_supernodes=...)`` entry point is permanently forbidden project-wide
-    (SDS Section 5, Section 14.6, Section 22).
-  - Every simulated client evaluates against the identical shared global test
-    split — never a per-client test partition (SDS Section 14.3).
+    functions** and must never be collapsed or swapped. Fit reads both ``loss``
+    and ``accuracy`` (the keys ``FLClient.fit`` returns); eval reads only
+    ``accuracy`` (the single key ``FLClient.evaluate`` returns).
+  - The pinned API is ``flwr==1.8.0``'s ``start_simulation``. The newer
+    app-based ``flwr.simulation.run_simulation`` is permanently forbidden
+    project-wide (SDS Section 5 / 14.6 / 22).
 
-``run_federated_simulation`` is the project's single top-level federated
-orchestrator. It loads the processed data and preprocessing artifacts, shards
-the training split via ``partition_iid``, runs the production-scale simulation
-through the pinned ``start_simulation`` API, and rebuilds the global model from
-``SavingFedAvg.latest_parameters`` — never from a per-client local model.
-
-Per the SDS Section 11 import graph, ``src/federated/`` imports only from
-``src/utils/``, ``src/preprocessing/``, ``src/partitioning/``, and
-``src/models/``. It never imports ``src/centralized/``, ``src/evaluation/``,
-or ``src/explainability/``.
+``run_federated_simulation`` is the single top-level federated orchestrator: it
+shards the training split via ``partition_iid``, runs the simulation, and
+rebuilds the global model from ``SavingFedAvg.latest_parameters`` — never from
+a per-client local model.
 """
 
 import gc
@@ -77,16 +64,11 @@ __all__ = [
 class SavingFedAvg(FedAvg):
     """A ``FedAvg`` subclass that retains the latest aggregated parameters.
 
-    Purpose:
-        Neither ``flwr.simulation.start_simulation``'s return value nor a stock
-        ``FedAvg`` instance exposes the final round's aggregated global
-        parameters once the simulation ends. This minimal subclass captures
-        them on every successful aggregation so Phase 10 can rebuild and
-        persist the federated global model from ``latest_parameters``
-        (SDS Section 14.6).
-
-        This is the project's only strategy class — a plain ``FedAvg`` is never
-        instantiated directly for production use.
+    Neither ``start_simulation``'s return value nor a stock ``FedAvg`` exposes
+    the final round's aggregated global parameters once the simulation ends.
+    This subclass captures them on every successful aggregation so the
+    federated global model can be rebuilt from ``latest_parameters``
+    (SDS Section 14.6). It is the project's only strategy class.
 
     Attributes:
         latest_parameters: The most recently aggregated global parameters as a
@@ -97,19 +79,9 @@ class SavingFedAvg(FedAvg):
     def __init__(self, *args, **kwargs) -> None:
         """Initialize the strategy and the parameter-capture slot.
 
-        Purpose:
-            Forward every argument untouched to ``FedAvg.__init__`` and add the
-            ``latest_parameters`` capture slot, initialised to ``None``.
-
         Args:
             *args: Positional arguments forwarded verbatim to ``FedAvg``.
             **kwargs: Keyword arguments forwarded verbatim to ``FedAvg``.
-
-        Returns:
-            None
-
-        Raises:
-            Nothing beyond what ``FedAvg.__init__`` itself raises.
         """
         super().__init__(*args, **kwargs)
         self.latest_parameters = None
@@ -117,11 +89,9 @@ class SavingFedAvg(FedAvg):
     def aggregate_fit(self, server_round, results, failures):
         """Aggregate client weights for one round and capture the result.
 
-        Purpose:
-            Delegate aggregation to ``FedAvg.aggregate_fit`` and store the
-            aggregated parameters in ``self.latest_parameters`` whenever the
-            aggregation succeeds, so the final global model survives the end of
-            the simulation.
+        Delegates to ``FedAvg.aggregate_fit`` and stores the aggregated
+        parameters whenever aggregation succeeds, so the final global model
+        survives the end of the simulation.
 
         Args:
             server_round: The 1-based federated round number.
@@ -130,11 +100,8 @@ class SavingFedAvg(FedAvg):
 
         Returns:
             tuple: ``(aggregated_parameters, aggregated_metrics)`` exactly as
-                returned by ``FedAvg.aggregate_fit`` — the return value is
-                never altered, only observed.
-
-        Raises:
-            Nothing beyond what ``FedAvg.aggregate_fit`` itself raises.
+                returned by ``FedAvg.aggregate_fit`` — never altered, only
+                observed.
         """
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(
             server_round, results, failures
@@ -157,12 +124,10 @@ class SavingFedAvg(FedAvg):
 def weighted_average_fit(metrics: list[tuple[int, dict]]) -> dict:
     """Aggregate fit-time client metrics weighted by example count.
 
-    Purpose:
-        The ``fit_metrics_aggregation_fn`` for ``SavingFedAvg``. Operates on
-        ``FLClient.fit()``'s metrics dicts, which always contain **both**
-        ``"loss"`` and ``"accuracy"`` (SDS Section 14.5). This function is
-        never used for evaluate-time aggregation — that is
-        ``weighted_average_eval``'s exclusive role.
+    The ``fit_metrics_aggregation_fn`` for ``SavingFedAvg``, operating on
+    ``FLClient.fit()``'s dicts, which always contain **both** ``"loss"`` and
+    ``"accuracy"`` (SDS Section 14.5). Never used for evaluate-time
+    aggregation — that is ``weighted_average_eval``'s exclusive role.
 
     Args:
         metrics: One ``(num_examples, metrics_dict)`` pair per participating
@@ -192,14 +157,11 @@ def weighted_average_fit(metrics: list[tuple[int, dict]]) -> dict:
 def weighted_average_eval(metrics: list[tuple[int, dict]]) -> dict:
     """Aggregate evaluate-time client metrics weighted by example count.
 
-    Purpose:
-        The ``evaluate_metrics_aggregation_fn`` for ``SavingFedAvg``. Operates
-        on ``FLClient.evaluate()``'s metrics dicts, which contain only
-        ``"accuracy"`` (SDS Section 14.5). Evaluate-time loss aggregation is
-        handled natively by Flower via each client's returned ``loss`` tuple
-        element (into ``history.losses_distributed``) and requires no custom
-        function here. This function is never used for fit-time aggregation —
-        that is ``weighted_average_fit``'s exclusive role.
+    The ``evaluate_metrics_aggregation_fn`` for ``SavingFedAvg``, operating on
+    ``FLClient.evaluate()``'s dicts, which contain only ``"accuracy"``
+    (SDS Section 14.5). Evaluate-time loss needs no custom function: Flower
+    aggregates each client's returned ``loss`` natively into
+    ``history.losses_distributed``. Never used for fit-time aggregation.
 
     Args:
         metrics: One ``(num_examples, metrics_dict)`` pair per participating
@@ -225,22 +187,19 @@ def weighted_average_eval(metrics: list[tuple[int, dict]]) -> dict:
 def build_ray_init_args(config: dict) -> dict:
     """Assemble the ``ray_init_args`` dict for ``start_simulation``.
 
-    Purpose:
-        Ray on Windows backs its object store with a memory-mapped file sized,
-        by default, at roughly 30% of physical RAM. On a 16 GB laptop that is a
-        ~4.8 GB mapping requested up front, and once TensorFlow's four client
-        actors have taken their share, Windows can no longer commit it:
+    Ray on Windows backs its object store with a memory-mapped file sized by
+    default at ~30% of physical RAM. On a 16 GB laptop that is a ~4.8 GB
+    mapping requested up front, and once TensorFlow's client actors have taken
+    their share Windows can no longer commit it::
 
-            CreateFileMapping() failed. GetLastError() = 1450
+        CreateFileMapping() failed. GetLastError() = 1450
 
-        which is ``ERROR_NO_SYSTEM_RESOURCES`` and kills the raylet mid-run.
-        Capping ``object_store_memory`` keeps that mapping small enough to
-        always succeed.
+    which is ``ERROR_NO_SYSTEM_RESOURCES`` and kills the raylet mid-run.
+    Capping ``object_store_memory`` keeps the mapping small enough to succeed.
 
-        When ``federated.ray`` is absent from the config — which is the case
-        for the untouched production ``configs/config.yaml`` — this function
-        returns exactly the settings the project used before, so the
-        FULL_EXPERIMENT path is bit-for-bit unchanged.
+    When ``federated.ray`` is absent — the untouched production
+    ``configs/config.yaml`` case — the returned settings are exactly the
+    project's originals, so FULL_EXPERIMENT is bit-for-bit unchanged.
 
     Args:
         config: The loaded config dict. Reads the optional
@@ -278,20 +237,14 @@ def build_ray_init_args(config: dict) -> dict:
 def build_client_resources(config: dict):
     """Assemble Flower's per-client Ray actor resource request.
 
-    Purpose:
-        Flower derives the number of *concurrent* client actors from this dict:
+    Flower derives the number of *concurrent* client actors as
+    ``floor(ray_num_cpus / client_num_cpus)``. Every concurrent actor holds its
+    own TensorFlow runtime (~350-500 MB), CNN-GRU graph, and cached tensors, so
+    raising ``client_num_cpus`` *lowers* peak RAM by serialising the clients.
+    In LAPTOP_MODE the overlay makes exactly one client train at a time.
 
-            concurrent_actors = floor(ray_num_cpus / client_num_cpus)
-
-        Every concurrent actor holds its own TensorFlow runtime (~350-500 MB),
-        its own copy of the CNN-GRU graph, and its own cached feature tensors.
-        Raising ``client_num_cpus`` therefore *lowers* peak RAM by serialising
-        the clients. In LAPTOP_MODE the overlay sets ``num_cpus: 2`` and
-        ``client_num_cpus: 2``, so exactly one client trains at a time.
-
-        This changes nothing mathematically: clients within a FedAvg round are
-        independent, so running them sequentially yields the identical
-        aggregate as running them in parallel.
+    This changes nothing mathematically: clients within a FedAvg round are
+    independent, so sequential execution yields an identical aggregate.
 
     Args:
         config: The loaded config dict. Reads the optional
@@ -320,19 +273,15 @@ def subsample_for_server_eval(
 ) -> pandas.DataFrame:
     """Optionally shrink the server-side centralized evaluation split.
 
-    Purpose:
-        The server-side evaluation tensors stay resident for the whole
-        simulation. At ~443k test rows x 95 features x 4 bytes that is roughly
-        168 MB of float32 held alongside every client actor. In LAPTOP_MODE
-        ``runtime_profile.server_eval_max_rows`` caps that at 50k rows (~19 MB).
+    These tensors stay resident for the whole simulation: ~443k test rows x 95
+    features x 4 bytes is roughly 168 MB of float32 held alongside every client
+    actor. ``runtime_profile.server_eval_max_rows`` caps that (50k rows,
+    ~19 MB, in LAPTOP_MODE).
 
-        The subsample is stratified on ``label`` and drawn with the project
-        seed, so the accuracy estimate stays representative and reproducible;
-        at 50k rows the sampling error on an accuracy figure is well under
-        +/-0.5%.
-
-        When the key is absent — the FULL_EXPERIMENT case — the full split is
-        returned unchanged.
+    The subsample is stratified on ``label`` and drawn with the project seed,
+    so the estimate stays representative and reproducible; at 50k rows the
+    sampling error on an accuracy figure is well under +/-0.5%. When the key is
+    absent — the FULL_EXPERIMENT case — the full split is returned unchanged.
 
     Args:
         test_data: The shared global test split.
@@ -392,23 +341,16 @@ def make_server_side_evaluate_fn(
 ):
     """Build the server-side centralized evaluation callback.
 
-    Purpose:
-        Client-side distributed evaluation answers "how does the global model
-        do on each client's copy of the test split?"; it is aggregated by
-        example count and is the only signal the project previously recorded.
-        Flower's ``evaluate_fn`` hook answers a different and more
-        authoritative question: how does the *aggregated* model score on the
-        shared global test split, evaluated exactly once, on the server, with
-        no per-client weighting artefacts.
+    Distributed evaluation answers "how does the global model do on each
+    client's local data?"; this hook answers the more authoritative question of
+    how the *aggregated* model scores on the shared global test split, once, on
+    the server, with no per-client weighting artefacts. Both matter, because a
+    divergence between them is the standard symptom of aggregation going wrong
+    (weights averaged in the wrong order, a client returning stale parameters),
+    and with only distributed evaluation that failure is invisible.
 
-        Having both matters here because a divergence between the two is the
-        standard symptom of aggregation going wrong (e.g. weights averaged in
-        the wrong order, or a client returning stale parameters). With only
-        distributed evaluation, that failure is invisible.
-
-        The returned closure keeps ``X_test``/``y_test`` bound once, so the
-        test tensors are built a single time for the whole simulation rather
-        than per round.
+    The returned closure binds ``X_test``/``y_test`` once, so the test tensors
+    are built a single time for the whole simulation rather than per round.
 
     Args:
         config: Loaded config dict; ``training.batch_size`` is read.
@@ -456,23 +398,16 @@ def get_strategy(config: dict, evaluate_fn=None) -> SavingFedAvg:
 
     """Construct the federated aggregation strategy from the config.
 
-    Purpose:
-        Build the project's ``SavingFedAvg`` strategy with every minimum-client
-        threshold pinned to ``config["federated"]["num_clients"]`` and the two
-        distinct aggregation functions wired to their correct callback sites
-        (SDS Section 14.6).
-
-        A plain ``flwr.server.strategy.FedAvg`` is never returned: it does not
-        expose the final round's aggregated parameters, which Phase 10 requires
-        to build ``federated_global_model.h5``.
+    Builds ``SavingFedAvg`` with every minimum-client threshold pinned to
+    ``num_clients`` and the two distinct aggregation functions wired to their
+    correct callback sites (SDS Section 14.6). A stock ``FedAvg`` is never
+    returned: it does not expose the final round's aggregated parameters,
+    which building ``federated_global_model.h5`` requires.
 
     Args:
-        config: The loaded config dict. Only ``config["federated"]
-            ["num_clients"]`` is read — the production value is 4; the smoke
-            test supplies its own independently-constructed reduced config with
-            2 (SDS Section 19). Pinning all three minimums to that same
-            ``num_clients`` value guarantees the thresholds are always
-            satisfiable by exactly the number of clients being simulated.
+        config: The loaded config dict. Only ``federated.num_clients`` is read;
+            pinning all three minimums to it guarantees the thresholds are
+            always satisfiable by exactly the number of clients simulated.
 
     Returns:
         SavingFedAvg: The configured strategy, with
@@ -517,38 +452,22 @@ def run_federated_simulation(
 ) -> None:
     """Run the full federated simulation and persist the global model.
 
-    Purpose:
-        The project's single top-level federated orchestrator (SDS Section
-        14.6): load the processed dataset and preprocessing artifacts, shard
-        the training split via ``partition_iid``, launch
-        ``flwr.simulation.start_simulation`` for
-        ``config["federated"]["num_rounds"]`` rounds using the pinned
-        ``flwr==1.8.0`` client-function/strategy API, time only that call,
-        rebuild the global model from ``SavingFedAvg.latest_parameters``, and
-        persist every federated artifact named in SDS Section 9.
+    The single top-level federated orchestrator (SDS Section 14.6): shards the
+    training split via ``partition_iid``, runs ``start_simulation`` for
+    ``federated.num_rounds`` rounds under the pinned ``flwr==1.8.0`` API, times
+    only that call, and persists every federated artifact in SDS Section 9.
 
-        The saved ``federated_global_model.h5`` is *always* built by converting
-        ``strategy.latest_parameters`` via ``parameters_to_ndarrays`` and
-        loading those weights into a freshly constructed ``build_cnn_gru``
-        model. A per-client local model is never saved under that filename
-        (SDS Section 14.6, Section 22).
-
-        Only the shared global test split is used for client-side evaluation —
-        ``partition_iid`` is applied to the training rows exclusively
-        (SDS Section 14.3).
+    ``federated_global_model.h5`` is *always* built by converting
+    ``strategy.latest_parameters`` via ``parameters_to_ndarrays`` into a fresh
+    ``build_cnn_gru`` model. A per-client local model is never saved under that
+    filename (SDS Section 14.6 / 22). ``partition_iid`` is applied to training
+    rows exclusively (SDS Section 14.3).
 
     Args:
-        config: Fully loaded config dict from
-            ``src.utils.config_loader.load_config()``. Production federated
-            values are read as-is: ``federated.num_clients`` (4),
-            ``federated.num_rounds`` (15), ``federated.local_epochs`` (2).
-        logger: Optional pre-constructed ``logging.Logger`` passed down from
-            ``experiments/run_federated.py``. Modules under ``src/`` never
-            construct their own log file (SDS Section 13), so when this is
-            omitted a plain handler-less logger is used.
-
-    Returns:
-        None
+        config: Fully loaded config dict from ``load_config()``.
+        logger: Optional logger from ``experiments/run_federated.py``. Modules
+            under ``src/`` never construct their own log file (SDS Section 13),
+            so omitting it yields a handler-less logger.
 
     Raises:
         RuntimeError: If ``strategy.latest_parameters`` is still ``None`` after

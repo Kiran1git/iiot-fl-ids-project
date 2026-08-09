@@ -1,26 +1,18 @@
 """Centralized CNN-GRU baseline training for the IIoT Federated IDS project.
 
-This module owns the centralized training path (SDS Section 14.7). It trains the
-single, frozen CNN-GRU architecture on the full training split (no partitioning),
-with early stopping and best-model checkpointing, times only the ``.fit()`` call,
-and persists every centralized artifact named in SDS Section 9.
+Owns the centralized training path (SDS Section 14.7): trains the frozen
+CNN-GRU on the full training split (no partitioning) and persists every
+centralized artifact named in SDS Section 9.
 
 Ownership and reuse rules:
-  - The model is built exclusively via ``src.models.cnn_gru.build_cnn_gru`` —
-    no second model-construction function exists anywhere in the project.
-  - Tensors are built exclusively via
-    ``src.preprocessing.encode_normalize.prepare_model_ready_data`` — the
+  - The model is built exclusively via ``src.models.cnn_gru.build_cnn_gru``.
+  - Tensors are built exclusively via ``prepare_model_ready_data``; the
     reshape/one-hot logic is never reimplemented here.
-  - ``num_classes`` is derived at runtime as ``len(class_mapping)`` from
-    ``outputs/artifacts/class_mapping.json`` — never a hardcoded literal.
+  - ``num_classes`` is derived at runtime as ``len(class_mapping)``.
   - ``centralized_best_model.h5`` (lowest ``val_loss``) is the only centralized
-    model any downstream code reads; ``centralized_last_model.h5`` is audit-only.
+    model downstream code reads; ``centralized_last_model.h5`` is audit-only.
   - ``time.time()`` wraps only the ``.fit()`` call — never surrounding I/O,
     artifact persistence, or diagram generation.
-
-Per the SDS Section 11 import graph, this layer imports only from src/utils/,
-src/preprocessing/, and src/models/. It never imports src/federated/,
-src/partitioning/, src/evaluation/, or src/explainability/.
 """
 
 import json
@@ -50,34 +42,21 @@ def train_centralized_model(
 ) -> None:
     """Train the centralized CNN-GRU baseline and persist all artifacts.
 
-    Purpose:
-        Load the processed dataset and preprocessing artifacts, build the
-        CNN-GRU model via ``build_cnn_gru``, train it on the full training
-        split with ``EarlyStopping`` and ``ModelCheckpoint`` callbacks, measure
-        wall-clock training duration around the ``.fit()`` call only, and
-        persist the best/last models, the model summary, the architecture
-        diagram, the per-epoch history CSV, and the training-time file
-        (SDS Section 14.7).
-
-        ``validation_split`` is applied by Keras internally to
-        ``(X_train, y_train)`` — no separate held-out validation file is
-        produced or read.
+    Trains with ``EarlyStopping`` + ``ModelCheckpoint``, times only ``.fit()``,
+    and writes the best/last models, model summary, architecture diagram,
+    per-epoch history CSV, and training-time file (SDS Section 14.7).
+    ``validation_split`` is applied by Keras internally to
+    ``(X_train, y_train)`` — no separate held-out validation file exists.
 
     Args:
-        config: Fully loaded config dict from
-            ``src.utils.config_loader.load_config()``.
-        logger: Optional pre-constructed ``logging.Logger`` passed down from
-            ``experiments/run_centralized.py``. Modules under ``src/`` never
-            construct their own log file (SDS Section 13), so when this is
-            omitted a plain handler-less logger is used and no log file beyond
-            the five fixed names in SDS Section 13 is ever created.
-
-    Returns:
-        None
+        config: Fully loaded config dict from ``load_config()``.
+        logger: Optional logger from ``experiments/run_centralized.py``.
+            Modules under ``src/`` never construct their own log file (SDS
+            Section 13), so omitting it yields a handler-less logger rather
+            than a new log file.
 
     Raises:
-        Propagates any Keras training exception (and any I/O exception raised
-        while loading artifacts or persisting outputs) after logging the full
+        Propagates any Keras training or I/O exception after logging the full
         stack trace at ERROR level.
     """
     if logger is None:

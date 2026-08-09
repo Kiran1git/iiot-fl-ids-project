@@ -64,10 +64,9 @@ _MODE_OVERLAY_FILES = {
 def resolve_mode(mode: str = None) -> str:
     """Resolve the active run profile name.
 
-    Purpose:
-        Apply the fixed precedence — explicit argument, then the ``IIOT_MODE``
-        environment variable, then ``FULL_EXPERIMENT`` — so a laptop run can be
-        selected with ``set IIOT_MODE=LAPTOP_MODE`` and nothing else.
+    Applies the fixed precedence — explicit argument, then the ``IIOT_MODE``
+    environment variable, then ``FULL_EXPERIMENT`` — so a laptop run can be
+    selected with ``set IIOT_MODE=LAPTOP_MODE`` and nothing else.
 
     Args:
         mode: Explicit profile name, or ``None`` to fall back to the
@@ -97,11 +96,10 @@ def resolve_mode(mode: str = None) -> str:
 def _deep_merge(base: dict, overlay: dict) -> dict:
     """Recursively merge ``overlay`` into a copy of ``base``.
 
-    Purpose:
-        Let an overlay file restate only the keys it changes. A shallow
-        ``dict.update`` would replace the whole ``federated`` block, silently
-        deleting ``partition_strategy`` and every other key the overlay did not
-        happen to repeat — so the merge must recurse.
+    Lets an overlay file restate only the keys it changes. A shallow
+    ``dict.update`` would replace the whole ``federated`` block, silently
+    deleting ``partition_strategy`` and every other key the overlay did not
+    happen to repeat — so the merge must recurse.
 
     Args:
         base: The base config (never mutated).
@@ -130,15 +128,10 @@ def load_config(
 ) -> dict:
     """Load, merge, and validate the project YAML configuration.
 
-    Purpose:
-        Read the base config into a Python dictionary, deep-merge the active
-        run profile's overlay on top of it, and validate that every required
-        top-level key is present. This is the single authoritative
-        config-loading call for the entire project — no other module may
-        re-implement YAML loading, overlay merging, or key validation.
-
-        Validation runs **after** the merge, so an overlay can never leave the
-        config missing a required section.
+    Reads the base config, deep-merges the active run profile's overlay on top,
+    then validates that every required top-level key is present. This is the
+    single authoritative config-loading call for the entire project — no other
+    module may re-implement YAML loading, overlay merging, or key validation.
 
     Args:
         config_path: Path to the base YAML configuration file.

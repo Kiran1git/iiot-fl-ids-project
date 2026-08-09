@@ -59,11 +59,10 @@ def generate_shap_explanations(
 ) -> list:
     """Compute SHAP values, save both plots, and persist the background sample.
 
-    Purpose:
-        Sample a seeded background set from the training tensor, sample a seeded
-        set of test instances, compute SHAP values for those instances via
-        ``shap.GradientExplainer``, save the summary (beeswarm) and bar plots,
-        and persist the background array for reuse by the dashboard.
+    Draws a seeded background set from the training tensor and a seeded set of
+    test instances, computes SHAP values via ``shap.GradientExplainer``, saves
+    the summary (beeswarm) and bar plots, and persists the background array for
+    reuse by the dashboard.
 
     Args:
         model: The trained Keras model being explained (the federated global
@@ -239,16 +238,13 @@ def explain_single_prediction(
 ) -> list:
     """Compute SHAP values for exactly one sample, ready for bar rendering.
 
-    Purpose:
-        Serve the dashboard's per-prediction explanation view.  Applies the
-        identical squeeze steps as ``generate_shap_explanations``, so the
-        caller receives a 2D per-class structure aligned with
-        ``(num_features,)``.
+    Serves the dashboard's per-prediction explanation view, applying the same
+    squeeze steps as ``generate_shap_explanations`` so the caller receives a 2D
+    per-class structure aligned with ``(num_features,)``.
 
-        This function never re-samples or regenerates the background
-        distribution.  The caller (``dashboard/app.py``) loads the persisted
-        ``outputs/artifacts/shap_background.npy`` and constructs ``explainer``
-        from it before calling here (SDS Sections 14.10 and 18).
+    Never re-samples or regenerates the background distribution: the caller
+    (``dashboard/app.py``) loads the persisted ``shap_background.npy`` and
+    constructs ``explainer`` from it before calling here (SDS §14.10 / §18).
 
     Args:
         model: The trained Keras model being explained.  Retained for API
@@ -265,9 +261,6 @@ def explain_single_prediction(
 
     Raises:
         Propagates any SHAP runtime exception.
-
-    Dependencies:
-        shap.GradientExplainer.
     """
     shap_values = explainer.shap_values(sample)
 
@@ -288,23 +281,17 @@ def get_top_feature_contributions(
 ) -> "list":
     """Rank the features that drove one prediction, for the class predicted.
 
-    Purpose:
-        Turn the raw per-class SHAP output into the table the dashboard shows
-        under "Why did the model make this prediction?".
+    Turns the raw per-class SHAP output into the table the dashboard shows
+    under "Why did the model make this prediction?".
 
-        The ranking is taken from the row of ``shap_values`` belonging to the
-        **predicted class**, not the mean across all classes. The distinction
-        matters: a mean-across-classes ranking answers "which features does
-        this model generally react to here", whereas the question actually
-        being asked is "why *this* class". Only the predicted class's row
-        carries signed evidence for the answer that was given — positive values
-        pushed the model toward that class, negative values pushed against it,
-        and averaging absolute values across 15 classes destroys exactly that
-        sign information.
-
-        Rows are ordered by absolute contribution so the strongest evidence
-        appears first regardless of direction, while the signed value is
-        preserved for display.
+    The ranking comes from the row belonging to the **predicted class**, not
+    the mean across all classes. A mean-across-classes ranking answers "which
+    features does this model generally react to here", whereas the question
+    asked is "why *this* class". Only the predicted class's row carries signed
+    evidence for the answer given — positive values pushed toward that class,
+    negative against — and averaging absolute values across 15 classes destroys
+    exactly that sign information. Rows are ordered by absolute contribution so
+    the strongest evidence appears first, with the signed value preserved.
 
     Args:
         shap_values: The per-class list returned by
@@ -328,9 +315,6 @@ def get_top_feature_contributions(
         ValueError: If the SHAP row and ``feature_names`` disagree in length,
             which would mean the explanation is misaligned with the features it
             claims to name.
-
-    Dependencies:
-        numpy.
     """
     if predicted_class_index < 0 or predicted_class_index >= len(shap_values):
         raise IndexError(

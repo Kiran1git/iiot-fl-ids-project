@@ -1,46 +1,27 @@
-"""Federated client implementation for the IIoT Federated IDS project — Phase 8.
+"""Federated client implementation for the IIoT Federated IDS project.
 
-This module owns the single, authoritative Flower client for the entire project
-(SDS Section 14.5). ``FLClient`` wraps one virtual client's local model and data
-shard for Flower's simulation engine; ``client_fn`` is the factory the pinned
-``flwr==1.8.0`` ``start_simulation`` API calls to instantiate a client from a
-client-ID string. No alternate client class or second factory may be introduced
-anywhere in the codebase.
+Owns the single, authoritative Flower client (SDS Section 14.5). ``FLClient``
+wraps one virtual client's local model and data shard; ``client_fn`` is the
+factory ``flwr==1.8.0``'s ``start_simulation`` calls to build a client from a
+client-ID string. No alternate client class or second factory may exist.
 
 Ownership and reuse rules:
-  - Each ``FLClient`` receives its own disjoint training shard produced by
-    ``partition_iid`` (SDS Section 14.3) plus the **same shared global test
-    split** — identical for every client, never a per-client test partition
-    (SDS Section 14.3, authoritative note).
-  - The local model is built exclusively via
-    ``src.models.cnn_gru.build_cnn_gru`` — the project's only model builder.
-  - Tensors are built exclusively via
-    ``src.preprocessing.encode_normalize.prepare_model_ready_data`` — the
-    reshape/one-hot logic is never reimplemented here (SDS Section 22).
-  - ``set_global_seed(config["seed"])`` is called before model instantiation,
-    because Flower's simulation engine may run clients in separate processes
-    (SDS Section 12, Section 14.5 "Critical requirement").
-  - Clients never persist anything to disk. Only the server persists the final
-    global model (SDS Section 14.5: "Writes: Nothing").
-  - This module performs **no file I/O at all**: every value it needs arrives
-    through the constructor arguments or through the ``config`` dict prepared
-    by the orchestrator, so the same client works unchanged against synthetic
-    in-memory data (Phase 9's smoke test) and against the real processed
-    dataset (Phase 10's full run).
+  - Each client gets its own disjoint training shard from ``partition_iid``
+    plus the **same shared global test split** — never a per-client test
+    partition (SDS Section 14.3, authoritative note).
+  - The local model comes exclusively from ``build_cnn_gru``, and tensors
+    exclusively from ``prepare_model_ready_data`` (SDS Section 22).
+  - ``set_global_seed(config["seed"])`` runs before model instantiation,
+    because Flower may run clients in separate processes (SDS Section 12).
+  - Clients never persist anything; only the server saves the global model.
+  - This module performs **no file I/O at all** — every value arrives via
+    constructor arguments or ``config``, so the same client works unchanged
+    against synthetic in-memory data and the real processed dataset.
 
-Runtime values supplied by the orchestrator through ``config`` (see
-``FLClient.__init__``): because SDS Section 14.5 fixes the constructor to
-exactly ``client_id``/``train_data``/``test_data``/``config`` and forbids this
-module from reading any file, the fitted ``LabelEncoder``, the ordered feature
-column list, and the derived class count are passed inside
-``config["runtime"]``. ``num_classes`` therefore still originates from
-``len(class_mapping)`` in the caller and is never hardcoded here (SDS Section 6).
-
-Per the SDS Section 11 import graph, ``src/federated/`` imports only from
-``src/utils/``, ``src/preprocessing/``, ``src/partitioning/``, and
-``src/models/``. It never imports ``src/centralized/``, ``src/evaluation/``,
-``src/explainability/``, or ``src.federated.server_app`` (which does not exist
-at this phase — no forward references).
+Because SDS Section 14.5 fixes the constructor signature and forbids file I/O
+here, the fitted ``LabelEncoder``, ordered feature columns, and class count
+arrive in ``config["runtime"]``. ``num_classes`` therefore still originates
+from ``len(class_mapping)`` in the caller and is never hardcoded (SDS §6).
 """
 
 import logging
@@ -73,12 +54,10 @@ _logger = logging.getLogger(__name__)
 class FLClient(NumPyClient):
     """Wrap one virtual client's local model and data shard for Flower.
 
-    Purpose:
-        Provide the ``flwr.client.NumPyClient`` implementation used by every
-        simulated client: hold one disjoint training shard plus the shared
-        global test split, build a local CNN-GRU model, and expose
-        ``get_parameters``, ``fit``, and ``evaluate`` to the Flower simulation
-        engine (SDS Section 14.5).
+    The ``flwr.client.NumPyClient`` implementation used by every simulated
+    client: holds one disjoint training shard plus the shared global test
+    split, builds a local CNN-GRU, and exposes ``get_parameters``, ``fit``,
+    and ``evaluate`` to the simulation engine (SDS Section 14.5).
 
     Attributes:
         client_id: This virtual client's integer identifier.
@@ -103,25 +82,19 @@ class FLClient(NumPyClient):
     ) -> None:
         """Create one simulated federated client.
 
-        Purpose:
-            Store this client's shard and the shared global test split, seed
-            every random source via ``set_global_seed`` **before** any model is
-            instantiated, then build the local CNN-GRU model.
+        Seeds every random source via ``set_global_seed`` **before** the model
+        is instantiated, then builds the local CNN-GRU.
 
         Args:
             client_id: This virtual client's integer identifier (0-based).
-            train_data: This client's disjoint training shard, produced by
-                ``partition_iid`` on the training split only.
-            test_data: The shared global test split (``test_indices.pkl`` rows),
-                identical for every client — never a per-client partition.
-            config: The orchestrator-supplied config dict. Keys read here:
-                ``seed`` (for ``set_global_seed``), ``model`` and ``training``
-                (forwarded verbatim to ``build_cnn_gru``), and the
-                ``runtime`` sub-dict carrying ``feature_columns``,
-                ``label_encoder``, and ``num_classes``.
-
-        Returns:
-            None
+            train_data: This client's disjoint training shard from
+                ``partition_iid``, on the training split only.
+            test_data: The shared global test split, identical for every
+                client — never a per-client partition.
+            config: Orchestrator-supplied config. Keys read here: ``seed``,
+                ``model`` and ``training`` (forwarded to ``build_cnn_gru``),
+                and ``runtime`` (``feature_columns``, ``label_encoder``,
+                ``num_classes``).
 
         Raises:
             KeyError: If ``config`` is missing ``seed``, ``model``,
@@ -241,9 +214,7 @@ class FLClient(NumPyClient):
     def get_parameters(self, config: dict) -> list[numpy.ndarray]:
         """Return the current local model weights.
 
-        Purpose:
-            Hand the local model's weights to the Flower server, which uses
-            them to initialise the global model in round 1.
+        The server uses these to initialise the global model in round 1.
 
         Args:
             config: Flower's per-call instruction dict. Present to satisfy the
@@ -251,9 +222,6 @@ class FLClient(NumPyClient):
 
         Returns:
             list[numpy.ndarray]: The local model's current weights.
-
-        Raises:
-            Nothing under normal operation.
         """
         return self.model.get_weights()
 
@@ -264,11 +232,8 @@ class FLClient(NumPyClient):
     ) -> tuple[list[numpy.ndarray], int, dict]:
         """Train the local model on this client's shard for one FL round.
 
-        Purpose:
-            Load the server's global weights, train locally for
-            ``federated.local_epochs`` epochs at ``training.batch_size``, and
-            return the updated weights, this client's example count, and the
-            final local epoch's metrics.
+        Loads the server's global weights and trains locally for
+        ``federated.local_epochs`` epochs at ``training.batch_size``.
 
         Args:
             parameters: The global model weights sent by the server.
@@ -277,17 +242,13 @@ class FLClient(NumPyClient):
                 batch size come from the project config exclusively.
 
         Returns:
-            tuple[list[numpy.ndarray], int, dict]:
-                - Updated local weights after local training.
-                - ``self.num_train_examples`` — this client's LOCAL TRAINING
-                  example count (shard minus local validation split), used by
-                  the server as the FedAvg aggregation weight.
-
-                - Metrics dict ``{"loss": ..., "accuracy": ...}`` taken from
-                  the final local epoch of ``history.history``. **Both keys
-                  are always present**, because this dict is consumed
-                  exclusively by ``weighted_average_fit``, which requires both
-                  (SDS Section 14.5 / 14.6).
+            tuple[list[numpy.ndarray], int, dict]: updated local weights,
+                ``self.num_train_examples`` (the LOCAL TRAINING count, i.e.
+                shard minus local validation split, used as FedAvg's
+                aggregation weight), and the final local epoch's
+                ``{"loss", "accuracy"}``. **Both metric keys are always
+                present**, since ``weighted_average_fit`` requires both
+                (SDS Section 14.5 / 14.6).
 
         Raises:
             Propagates any Keras training exception after logging it at ERROR
@@ -348,18 +309,12 @@ class FLClient(NumPyClient):
     ) -> tuple[float, int, dict]:
         """Evaluate the global weights on this client's local validation split.
 
-        Purpose:
-            Load the server's global weights and evaluate them against the
-            fraction of this client's own shard held out in ``__init__``
-            (``federated.client_val_split``). Distributed evaluation therefore
-            reports four genuinely different local scores, which is what
-            FedAvg's example-weighted aggregation is designed to combine.
-
-            The shared global test split is evaluated once per round by the
-            server itself (``make_server_side_evaluate_fn`` in
-            ``server_app.py``), so it remains a true held-out set instead of
-            being scored by every client every round.
-
+        Scores the fraction of this client's own shard held out in
+        ``__init__`` (``federated.client_val_split``), so distributed
+        evaluation reports genuinely different local scores — what FedAvg's
+        example-weighted aggregation is designed to combine. The shared global
+        test split is scored once per round by the server itself, so it stays
+        a true held-out set.
 
         Args:
             parameters: The global model weights sent by the server.
@@ -367,17 +322,12 @@ class FLClient(NumPyClient):
                 ``NumPyClient`` interface; no key is read from it.
 
         Returns:
-            tuple[float, int, dict]:
-                - ``loss`` from ``model.evaluate`` — returned as the first
-                  tuple element so Flower aggregates it natively into
-                  ``history.losses_distributed``.
-                - ``self.num_validation_examples`` — this client's local
-                  validation row count, used as the aggregation weight.
-
-                - Metrics dict ``{"accuracy": ...}``. **Only ``accuracy`` is
-                  present**, because this dict is consumed exclusively by
-                  ``weighted_average_eval``, which reads only that key
-                  (SDS Section 14.5 / 14.6).
+            tuple[float, int, dict]: ``loss`` first, so Flower aggregates it
+                natively into ``history.losses_distributed``;
+                ``self.num_validation_examples`` as the aggregation weight;
+                and ``{"accuracy": ...}``. **Only ``accuracy`` is present**,
+                since ``weighted_average_eval`` reads only that key
+                (SDS Section 14.5 / 14.6).
 
         Raises:
             Propagates any Keras evaluation exception after logging it at ERROR
@@ -431,12 +381,10 @@ def client_fn(
 ):
     """Instantiate the client Flower's simulation engine asks for.
 
-    Purpose:
-        The factory required by ``flwr.simulation.start_simulation``. The
-        orchestrator binds the pre-computed shards, the single shared test
-        split, and the config once — via ``functools.partial`` — and passes the
-        resulting single-argument callable to ``start_simulation``, so Flower
-        only ever supplies ``cid``. Nothing is re-read from disk on any call.
+    The factory required by ``flwr.simulation.start_simulation``. The
+    orchestrator binds the shards, shared test split, and config once via
+    ``functools.partial``, so Flower only ever supplies ``cid`` and nothing is
+    re-read from disk on any call.
 
     Args:
         cid: The client ID, which Flower always passes as a string.

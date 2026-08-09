@@ -1,20 +1,16 @@
 """Evaluation metrics and visualization functions for the IIoT project.
 
-This module owns the metric-computation and plot-generation contracts of
-SDS Section 14.8. Each plot listed in SDS Section 17 has exactly one owning
-function here, and no call site may reimplement any of them.
+Owns the metric-computation and plot-generation contracts of SDS Section 14.8.
+Each plot in SDS Section 17 has exactly one owning function here, and no call
+site may reimplement any of them.
 
 Function ownership:
-  - generate_class_distribution_plot: called by experiments/run_preprocessing.py
-    immediately after run_preprocessing_pipeline returns (created early — the
-    explicit cross-boundary exception in SDS Section 14.2 / Phase 4 allow-list).
-  - compute_all_metrics, generate_confusion_matrix,
-    generate_classification_report, generate_training_curves_plot: called by
-    src/evaluation/compare_fl_vs_centralized.py::run_evaluation_pipeline,
-    driven by experiments/run_evaluation.py.
-
-Per SDS Section 11's import graph this module imports nothing from
-src/preprocessing/, src/models/, src/centralized/, or src/federated/.
+  - ``generate_class_distribution_plot``: called by
+    ``experiments/run_preprocessing.py`` right after the pipeline returns (the
+    explicit cross-boundary exception in SDS Section 14.2).
+  - ``compute_all_metrics``, ``generate_confusion_matrix``,
+    ``generate_classification_report``, ``generate_training_curves_plot``:
+    called by ``run_evaluation_pipeline``.
 """
 
 import os
@@ -41,30 +37,15 @@ def generate_class_distribution_plot(
 ) -> None:
     """Plot a bar chart of sample counts per attack category and save to disk.
 
-    Purpose:
-        Count samples per unique value of ``label_column``, then produce and
-        save a horizontal bar chart at ``output_path``.  Called from
-        ``experiments/run_preprocessing.py`` immediately after
-        ``run_preprocessing_pipeline`` returns.
-
     Args:
-        df: Labeled (and optionally processed) DataFrame containing at minimum
-            the ``label_column``.  The in-memory result of the preprocessing
-            pipeline, or ``data/processed/edge_iiotset_processed.csv``
-            reloaded.
-        label_column: Name of the label column to count
-            (always ``"label"`` in this project).
-        output_path: Absolute or relative path where the PNG is saved
+        df: Labeled DataFrame containing at minimum ``label_column`` — the
+            in-memory pipeline result or the reloaded processed CSV.
+        label_column: Name of the label column to count (always ``"label"``).
+        output_path: Where the PNG is saved
             (``outputs/results/class_distribution.png``).
-
-    Returns:
-        None
 
     Raises:
         KeyError: If ``label_column`` is not present in ``df``.
-
-    Dependencies:
-        pandas, matplotlib.
     """
     if label_column not in df.columns:
         raise KeyError(
@@ -97,11 +78,9 @@ def compute_all_metrics(
 ) -> dict:
     """Compute the full metric suite for a set of predictions.
 
-    Purpose:
-        Compute accuracy plus macro- and weighted-averaged precision, recall
-        and F1 for one model's predictions against ground truth.  This is the
-        single metric-computation function in the project — no call site may
-        recompute any of these values independently.
+    Accuracy plus macro- and weighted-averaged precision, recall, and F1. The
+    project's single metric-computation function — no call site may recompute
+    any of these values independently.
 
     Args:
         y_true: Integer class indices of the ground-truth labels, shape
@@ -122,9 +101,6 @@ def compute_all_metrics(
 
     Raises:
         ValueError: If ``y_true`` and ``y_pred`` differ in length.
-
-    Dependencies:
-        sklearn.metrics (accuracy_score, precision_recall_fscore_support).
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -168,11 +144,9 @@ def generate_confusion_matrix(
 ) -> np.ndarray:
     """Compute a confusion matrix, save it as a heatmap PNG, and return it.
 
-    Purpose:
-        Own the confusion-matrix deliverable for both models (SDS Section 17).
-        Called twice by ``run_evaluation_pipeline`` — once for the centralized
-        model and once for the federated global model — with different
-        ``output_path`` values.
+    The confusion-matrix deliverable for both models (SDS Section 17). Called
+    twice by ``run_evaluation_pipeline`` — centralized and federated — with
+    different ``output_path`` values.
 
     Args:
         y_true: Integer class indices of the ground-truth labels.
@@ -184,12 +158,6 @@ def generate_confusion_matrix(
     Returns:
         numpy.ndarray: The raw confusion matrix, shape
             ``(len(class_names), len(class_names))``.
-
-    Raises:
-        Nothing under normal operation.
-
-    Dependencies:
-        sklearn.metrics.confusion_matrix, matplotlib.
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -248,10 +216,8 @@ def generate_classification_report(
 ) -> str:
     """Compute the per-class precision/recall/F1 report and save it as text.
 
-    Purpose:
-        Own the classification-report deliverable for both models.  Called
-        twice by ``run_evaluation_pipeline`` with different ``output_path``
-        values.
+    The classification-report deliverable for both models. Called twice by
+    ``run_evaluation_pipeline`` with different ``output_path`` values.
 
     Args:
         y_true: Integer class indices of the ground-truth labels.
@@ -262,12 +228,6 @@ def generate_classification_report(
 
     Returns:
         str: The report text, exactly as written to disk.
-
-    Raises:
-        Nothing under normal operation.
-
-    Dependencies:
-        sklearn.metrics.classification_report.
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -293,11 +253,8 @@ def generate_training_curves_plot(
 ) -> None:
     """Plot the centralized model's per-epoch loss and accuracy curves.
 
-    Purpose:
-        Own the ``centralized_training_curves.png`` deliverable
-        (SDS Section 17).  Reads the history CSV written by
-        ``train_centralized_model`` and renders train/validation loss and
-        train/validation accuracy side by side.
+    Owns the ``centralized_training_curves.png`` deliverable (SDS Section 17),
+    reading the history CSV written by ``train_centralized_model``.
 
     Args:
         history_csv_path: Path to ``outputs/results/centralized_history.csv``
@@ -305,14 +262,8 @@ def generate_training_curves_plot(
         output_path: Path where the PNG is saved
             (``outputs/results/centralized_training_curves.png``).
 
-    Returns:
-        None
-
     Raises:
         FileNotFoundError: If ``history_csv_path`` does not exist.
-
-    Dependencies:
-        pandas, matplotlib.
     """
     if not os.path.exists(history_csv_path):
         raise FileNotFoundError(

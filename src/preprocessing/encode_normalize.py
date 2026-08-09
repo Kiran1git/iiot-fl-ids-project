@@ -1,28 +1,16 @@
 """Feature-type inference, encoding, scaling, splitting, and pipeline orchestration.
 
-This module owns the complete second half of the preprocessing pipeline:
-  - infer_feature_column_types  — sole classifier of categorical/numeric columns.
-  - fit_categorical_encoder     — OrdinalEncoder, fit on training rows only.
-  - fit_scaler                  — MinMaxScaler, fit on training rows only.
-  - fit_label_encoder           — LabelEncoder + class_mapping, training rows only.
-  - split_train_test            — single stratified 80/20 split; never repeated.
-  - prepare_model_ready_data    — sole tensor-preparation function for the CNN-GRU.
-  - run_preprocessing_pipeline  — top-level 11-step orchestrator.
-
 Ownership rules (SDS Section 14.2):
-  - infer_feature_column_types is the sole, authoritative column-classifier.
-  - prepare_model_ready_data is the sole tensor-preparation function;
-    every downstream module (centralized, federated, evaluation, explainability,
-    dashboard) calls this function rather than reimplementing it.
-  - All encoders/scalers are fit ONLY on df.loc[train_indices] — never on the
-    full dataset (that would be a leakage defect).
+  - ``infer_feature_column_types`` is the sole, authoritative column-classifier.
+  - ``prepare_model_ready_data`` is the sole tensor-preparation function; every
+    downstream module (centralized, federated, evaluation, explainability,
+    dashboard) calls it rather than reimplementing the reshape/one-hot logic.
+  - All encoders/scalers are fit ONLY on ``df.loc[train_indices]`` — fitting on
+    the full dataset would be a leakage defect.
   - The train/test split is computed once, persisted, and reused everywhere.
-  - run_preprocessing_pipeline respects force_reprocess: false — a second run
-    skips regeneration if the processed CSV already exists.
 """
 
 import json
-import logging
 import os
 import pickle
 
@@ -60,65 +48,36 @@ def infer_feature_column_types(
 ) -> tuple:
     """Classify DataFrame columns into categorical and numeric groups.
 
-    Purpose:
-        Deterministically partition the feature columns of ``df``, excluding
-        the label columns.  This is the single, authoritative column-
-        classification function — no other module may independently
-        reclassify columns.
+    The single, authoritative column-classifier — no other module may
+    independently reclassify columns.
 
-        Two rules are implemented:
+    ``"dtype_object"`` (legacy) puts every object/category column into one
+    undifferentiated group for ordinal encoding. ``"cardinality"``
+    (production) splits them on distinct-value count, because ordinal-encoding
+    a nominal column is a modelling error rather than a style choice:
+    ``OrdinalEncoder`` maps categories to 0, 1, 2, ... and the Conv1D/GRU stack
+    reads those integers as a *magnitude*, inventing an ordering
+    (``GET < POST < PUT``) that does not exist in the data.
 
-        ``"dtype_object"`` (legacy)
-            Returns a 2-tuple ``(categorical_columns, numeric_columns)``.
-            Every object/category column lands in one undifferentiated
-            categorical group, which the caller then ordinal-encodes.
-
-        ``"cardinality"`` (production)
-            Returns a 3-tuple
-            ``(low_cardinality_columns, high_cardinality_columns,
-            numeric_columns)``.  Object/category columns are split on their
-            distinct-value count in ``df``: at most ``low_cardinality_max``
-            distinct values means the column is safe to one-hot encode, more
-            than that means one-hot would explode the feature count and the
-            column is routed to a frequency encoder instead.
-
-            This split exists because ordinal-encoding a nominal column is a
-            modelling error, not just a style choice: ``OrdinalEncoder`` maps
-            categories to 0, 1, 2, ... and the Conv1D/GRU stack then reads
-            those integers as a *magnitude*, inventing an ordering
-            (``GET < POST < PUT``) that does not exist in the data.
-
-        Because this function is called on ``df.loc[train_indices]`` by
-        ``run_preprocessing_pipeline``, the cardinality counts are measured on
-        training rows only — a test-set-only category can never influence how
-        a column is classified.
+    Called on ``df.loc[train_indices]``, so cardinality is measured on training
+    rows only and a test-set-only category can never influence classification.
 
     Args:
-        df: DataFrame after ``drop_identifier_columns`` and ``create_labels``
-            have run, so ``label`` and ``binary_label`` exist and
-            ``Attack_type`` / ``Attack_label`` are absent.
-        label_columns: Columns to exclude from every output list.
-            Defaults to ``["label", "binary_label"]``.
-        rule: ``"dtype_object"`` or ``"cardinality"``. Any other value raises
-            ``ValueError``.
+        df: DataFrame after ``drop_identifier_columns`` and ``create_labels``.
+        label_columns: Columns to exclude. Defaults to
+            ``["label", "binary_label"]``.
+        rule: ``"dtype_object"`` or ``"cardinality"``.
         low_cardinality_max: Distinct-value threshold separating the one-hot
-            group from the frequency-encoded group. Read from
-            ``config["dataset"]["low_cardinality_max"]``. Only used by the
-            ``"cardinality"`` rule.
+            group from the frequency-encoded group (``"cardinality"`` only).
 
     Returns:
-        tuple: For ``"dtype_object"``, a 2-tuple
-            ``(categorical_columns, numeric_columns)``. For ``"cardinality"``,
-            a 3-tuple ``(low_cardinality_columns, high_cardinality_columns,
-            numeric_columns)``. In both cases the lists preserve the original
-            DataFrame column order, are pairwise disjoint, and together cover
-            every non-label column.
+        tuple: 2-tuple ``(categorical, numeric)`` for ``"dtype_object"``;
+            3-tuple ``(low_cardinality, high_cardinality, numeric)`` for
+            ``"cardinality"``. Lists preserve DataFrame column order, are
+            pairwise disjoint, and cover every non-label column.
 
     Raises:
         ValueError: If ``rule`` is not a supported rule name.
-
-    Dependencies:
-        pandas.
     """
     if label_columns is None:
         label_columns = ["label", "binary_label"]
@@ -163,34 +122,23 @@ def fit_categorical_encoder(
 ) -> tuple:
     """Fit an OrdinalEncoder on categorical columns using only training rows.
 
-    Purpose:
-        Legacy single-group encoder, retained for the ``"dtype_object"`` rule
-        and for the existing unit tests. Fits
-        ``sklearn.preprocessing.OrdinalEncoder`` on the training-partition
-        slice ``df.loc[train_indices]`` (slicing is the caller's
-        responsibility — this function receives an already-sliced DataFrame).
-
-        **Production preprocessing no longer uses this function.** Ordinal
-        codes impose a false ordering on nominal features, so
-        ``run_preprocessing_pipeline`` calls
-        ``fit_categorical_transformer`` instead when
-        ``categorical_column_rule`` is ``"cardinality"``.
+    Legacy single-group encoder, retained for the ``"dtype_object"`` rule and
+    its unit tests. **Production preprocessing no longer uses this function**
+    — ordinal codes impose a false ordering on nominal features, so the
+    ``"cardinality"`` rule calls ``fit_categorical_transformer`` instead.
 
     Args:
-        df: Training-slice DataFrame (``df.loc[train_indices]``).
-        categorical_columns: List of column names to encode.
+        df: Training-slice DataFrame (``df.loc[train_indices]``); slicing is
+            the caller's responsibility.
+        categorical_columns: Column names to encode.
 
     Returns:
-        tuple[pd.DataFrame, OrdinalEncoder]: The training-slice DataFrame
-            with categorical columns replaced by ordinal integers, and the
-            fitted ``OrdinalEncoder``.
+        tuple[pd.DataFrame, OrdinalEncoder]: The slice with categoricals
+            replaced by ordinal integers, and the fitted encoder.
 
     Raises:
-        ValueError: If ``categorical_columns`` is non-empty but the list
-            passed does not match any columns in ``df``.
-
-    Dependencies:
-        sklearn.preprocessing.OrdinalEncoder, pandas.
+        ValueError: If ``categorical_columns`` is non-empty but matches no
+            column in ``df``.
     """
     encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
     if categorical_columns:
@@ -212,30 +160,20 @@ def fit_categorical_transformer(
 ) -> dict:
     """Fit the production categorical encoders on training rows only.
 
-    Purpose:
-        Replace the single ``OrdinalEncoder`` with two encoders chosen to
-        match what each column actually is:
+    Two encoders, each chosen to match what the column actually is:
 
-        - **Low-cardinality columns → one-hot.** ``OrdinalEncoder`` turns
-          ``http.request.method`` into 0-8, which the Conv1D kernel then reads
-          as a continuous magnitude, implying ``GET < POST < PUT``. That
-          ordering is fiction, and the convolution slides across adjacent
-          feature positions, so the fiction propagates. One-hot removes the
-          false metric entirely. Measured cost on this dataset is small: the
-          six genuinely nominal columns have 9, 5, 13, 13, 3, and 3 distinct
-          training values, so the expansion is roughly 46 columns.
+    - **Low-cardinality → one-hot.** Ordinal codes would make the Conv1D
+      kernel read ``http.request.method`` 0-8 as a continuous magnitude
+      (``GET < POST < PUT``), and the convolution slides across adjacent
+      feature positions, so that fiction propagates. Cost here is small: the
+      six nominal columns expand to roughly 46.
+    - **High-cardinality → frequency encoding.** One-hot would add thousands
+      of near-empty columns. Relative training frequency is a genuinely
+      ordered quantity (common vs. rare), so a numeric code is meaningful.
+      Categories absent from training map to 0.0.
 
-        - **High-cardinality columns → frequency encoding.** One-hot on a
-          column with thousands of levels would add thousands of near-empty
-          columns. Frequency encoding maps each category to its *training*
-          relative frequency, which is a genuinely ordered quantity (common
-          vs. rare), so a numeric code is meaningful here rather than
-          arbitrary. Categories absent from training map to 0.0, which is the
-          honest encoding of "never seen during training".
-
-        Both encoders are fit on the passed-in training slice only. The
-        returned bundle is applied to the full dataset by
-        ``apply_categorical_transformer``.
+    Both are fit on the passed-in training slice only; the bundle is applied
+    to the full dataset by ``apply_categorical_transformer``.
 
     Args:
         df: Training-slice DataFrame (``df.loc[train_indices]``).
@@ -243,22 +181,11 @@ def fit_categorical_transformer(
         high_cardinality_columns: Columns to frequency encode.
 
     Returns:
-        dict: The fitted transformer bundle, persisted verbatim as
-            ``categorical_encoder.pkl``. Keys:
-              - ``"onehot_columns"``: the input ``low_cardinality_columns``.
-              - ``"onehot_encoder"``: the fitted ``OneHotEncoder``, or ``None``
-                when there are no low-cardinality columns.
-              - ``"onehot_feature_names"``: the generated output column names,
-                in the exact order the encoder emits them.
-              - ``"frequency_columns"``: the input ``high_cardinality_columns``.
-              - ``"frequency_maps"``: ``{column: {category: relative_freq}}``,
-                computed on training rows only.
-
-    Raises:
-        Nothing under normal operation.
-
-    Dependencies:
-        sklearn.preprocessing.OneHotEncoder, pandas, numpy.
+        dict: The bundle persisted verbatim as ``categorical_encoder.pkl``,
+            with keys ``onehot_columns``, ``onehot_encoder`` (``None`` when
+            there are no low-cardinality columns), ``onehot_feature_names``
+            (in emission order), ``frequency_columns``, and ``frequency_maps``
+            (``{column: {category: relative_freq}}``, training rows only).
     """
     onehot_encoder = None
     onehot_feature_names: list = []
@@ -303,31 +230,23 @@ def apply_categorical_transformer(
 ) -> pd.DataFrame:
     """Apply a fitted categorical transformer bundle to a DataFrame.
 
-    Purpose:
-        The counterpart to ``fit_categorical_transformer``. Applied by
-        ``run_preprocessing_pipeline`` to the **full** dataset using encoders
-        fit on training rows only, so no test-set information ever reaches the
-        fitted parameters.
-
-        Original categorical columns are replaced: one-hot columns are dropped
-        and their generated indicator columns appended; frequency columns are
-        overwritten in place with their float frequency code.
+    Applied to the **full** dataset using encoders fit on training rows only,
+    so no test-set information reaches the fitted parameters. One-hot columns
+    are dropped and their indicators appended; frequency columns are
+    overwritten in place.
 
     Args:
         df: The DataFrame to transform (typically the full dataset).
-        transformer: The bundle returned by ``fit_categorical_transformer``.
+        transformer: The bundle from ``fit_categorical_transformer``.
 
     Returns:
-        pd.DataFrame: The transformed DataFrame. Column order is
-            ``[untouched columns..., one-hot indicator columns...]``, which is
-            captured in ``feature_names.pkl`` and is therefore the single
-            authoritative feature order for the rest of the project.
+        pd.DataFrame: Transformed, with column order
+            ``[untouched..., one-hot indicators...]``. That order is captured
+            in ``feature_names.pkl`` and is the single authoritative feature
+            order for the rest of the project.
 
     Raises:
         KeyError: If a column named in the bundle is absent from ``df``.
-
-    Dependencies:
-        pandas, numpy.
     """
     df = df.copy()
 
@@ -366,25 +285,13 @@ def fit_scaler(
 ) -> tuple:
     """Fit a MinMaxScaler on numeric columns using only training rows.
 
-    Purpose:
-        Fit ``sklearn.preprocessing.MinMaxScaler`` on the training-partition
-        slice (passed in by the orchestrator). Returns the scaled training-
-        slice DataFrame and the fitted scaler.
-
     Args:
         df: Training-slice DataFrame (``df.loc[train_indices]``).
-        numeric_columns: List of numeric column names to scale.
+        numeric_columns: Numeric column names to scale.
 
     Returns:
-        tuple[pd.DataFrame, MinMaxScaler]: The training-slice DataFrame
-            with numeric columns scaled to [0, 1], and the fitted
-            ``MinMaxScaler``.
-
-    Raises:
-        Nothing under normal operation.
-
-    Dependencies:
-        sklearn.preprocessing.MinMaxScaler, pandas.
+        tuple[pd.DataFrame, MinMaxScaler]: The slice with numeric columns
+            scaled to [0, 1], and the fitted scaler.
     """
     scaler = MinMaxScaler()
     df = df.copy()
@@ -402,28 +309,15 @@ def fit_label_encoder(
 ) -> tuple:
     """Fit a LabelEncoder on the label column of the training partition.
 
-    Purpose:
-        Fit ``sklearn.preprocessing.LabelEncoder`` on the training rows'
-        ``label`` column to produce integer class indices, and build a
-        ``class_mapping`` dict whose keys are stringified integer class
-        indices and whose values are class-name strings (required because
-        JSON object keys are always strings).
+    ``class_mapping`` keys are stringified integer indices because JSON object
+    keys are always strings.
 
     Args:
-        labels: The ``label`` column of the training-partition slice
-            (``df.loc[train_indices, "label"]``).
+        labels: ``df.loc[train_indices, "label"]``.
 
     Returns:
-        tuple[numpy.ndarray, LabelEncoder, dict]: Integer-encoded labels for
-            the training rows passed in, the fitted ``LabelEncoder``, and the
-            ``class_mapping`` dict
-            (``{str(class_index): class_name, ...}``).
-
-    Raises:
-        Nothing under normal operation.
-
-    Dependencies:
-        sklearn.preprocessing.LabelEncoder.
+        tuple[numpy.ndarray, LabelEncoder, dict]: Integer-encoded labels, the
+            fitted encoder, and ``{str(class_index): class_name, ...}``.
     """
     encoder = LabelEncoder()
     encoded_labels = encoder.fit_transform(labels)
@@ -445,32 +339,23 @@ def split_train_test(
 ) -> tuple:
     """Perform a single stratified train/test split on the labeled DataFrame.
 
-    Purpose:
-        Compute one stratified 80/20 (or ``test_size``-fraction) split on the
-        labeled, **unencoded, unscaled** DataFrame — before any encoding or
-        scaling has been fit or applied.  Returns row-index arrays into ``df``
-        (not re-shuffled copies of the data) so the indices can be persisted
-        and reused throughout the project without re-splitting.
+    Runs on the **unencoded, unscaled** frame, before any encoder or scaler is
+    fit. Returns row-index arrays rather than data copies, so the split can be
+    persisted and reused project-wide without ever being recomputed.
 
     Args:
         df: Labeled DataFrame post ``drop_identifier_columns`` +
-            ``create_labels``, before any encoding or scaling.
-        label_column: Name of the stratification column (``"label"``).
-        test_size: Fraction of data to reserve for testing
-            (``config["dataset"]["test_size"]``).
-        seed: Random seed for reproducibility
-            (``config["seed"]``).
+            ``create_labels``.
+        label_column: Stratification column (``"label"``).
+        test_size: Fraction reserved for testing.
+        seed: Random seed for reproducibility.
 
     Returns:
-        tuple[numpy.ndarray, numpy.ndarray]: ``(train_indices, test_indices)``
-            — arrays of integer row indices into ``df``.
+        tuple[numpy.ndarray, numpy.ndarray]: ``(train_indices, test_indices)``.
 
     Raises:
-        ValueError: If any class has fewer than 2 samples (stratification
-            requires at least 2 samples per class).
-
-    Dependencies:
-        sklearn.model_selection.train_test_split.
+        ValueError: If any class has fewer than 2 samples, which stratification
+            requires.
     """
     indices = np.arange(len(df))
     stratify_labels = df[label_column].values
@@ -504,30 +389,23 @@ def prepare_model_features(
 ) -> np.ndarray:
     """Build the CNN-GRU feature tensor for a row subset, without labels.
 
-    Purpose:
-        The feature half of ``prepare_model_ready_data``, factored out so the
-        reshape lives in exactly one place. ``prepare_model_ready_data`` calls
-        this function to produce its ``X``, and the user-facing inference path
-        (``src/inference/predict.py``) calls it directly — user-supplied
-        traffic carries no ``label`` column, so it cannot go through the
-        labelled variant, and a second reshape implementation is precisely what
-        SDS §14.2 forbids.
+    The feature half of ``prepare_model_ready_data``, factored out so the
+    reshape lives in exactly one place. The user-facing inference path
+    (``src/inference/predict.py``) calls this directly, since user-supplied
+    traffic has no ``label`` column and a second reshape implementation is
+    precisely what SDS §14.2 forbids.
 
     Args:
         df: The fully processed (encoded, scaled) DataFrame, or a row-subset.
-        indices: Array of row indices into ``df`` selecting the subset to use.
-        feature_columns: Ordered list of feature column names, sourced from
-            ``feature_names.pkl`` (the fixed, persisted order).
+        indices: Row indices into ``df`` selecting the subset.
+        feature_columns: Ordered feature names from ``feature_names.pkl``.
 
     Returns:
-        numpy.ndarray: Shape ``(len(indices), len(feature_columns), 1)`` — the
-            feature tensor reshaped for ``Conv1D`` input.
+        numpy.ndarray: Shape ``(len(indices), len(feature_columns), 1)``,
+            reshaped for ``Conv1D`` input.
 
     Raises:
         KeyError: If any name in ``feature_columns`` is absent from ``df``.
-
-    Dependencies:
-        numpy, pandas.
     """
     # float32, not the pandas float64 default. Keras casts to float32 on the
     # way into the graph regardless, so building the tensor as float64 first
@@ -551,36 +429,25 @@ def prepare_model_ready_data(
 ) -> tuple:
     """Convert processed tabular data into CNN-GRU-ready tensors.
 
-    Purpose:
-        This is the single, shared tensor-preparation function for the entire
-        project. Every consumer — ``train_baseline.py``, ``client_app.py``,
-        ``compare_fl_vs_centralized.py``, ``shap_utils.py``, and
-        ``dashboard/app.py`` — calls this function rather than reimplementing
-        the reshape and one-hot-encoding logic.
+    The single, shared tensor-preparation function for the entire project.
+    Every consumer — ``train_baseline.py``, ``client_app.py``,
+    ``compare_fl_vs_centralized.py``, ``shap_utils.py``, ``dashboard/app.py``
+    — calls this rather than reimplementing the reshape/one-hot logic.
 
     Args:
         df: The fully processed (encoded, scaled) DataFrame, or a row-subset.
-        indices: Array of row indices into ``df`` selecting the subset to use.
-        feature_columns: Ordered list of feature column names, sourced from
-            ``feature_names.pkl`` (the fixed, persisted order).
-        label_encoder: Fitted ``sklearn.preprocessing.LabelEncoder`` loaded
-            from ``label_encoder.pkl``.
-        num_classes: Total number of classes, derived from
-            ``len(class_mapping)`` (``class_mapping.json``). Never hardcoded.
+        indices: Row indices into ``df`` selecting the subset.
+        feature_columns: Ordered feature names from ``feature_names.pkl``.
+        label_encoder: Fitted encoder from ``label_encoder.pkl``.
+        num_classes: ``len(class_mapping)``. Never hardcoded.
 
     Returns:
-        tuple[numpy.ndarray, numpy.ndarray]:
-            - ``X``: shape ``(len(indices), len(feature_columns), 1)`` —
-              the feature tensor reshaped for ``Conv1D`` input.
-            - ``y``: shape ``(len(indices), num_classes)`` — one-hot-encoded
-              integer class labels.
+        tuple[numpy.ndarray, numpy.ndarray]: ``X`` of shape
+            ``(len(indices), len(feature_columns), 1)`` and one-hot ``y`` of
+            shape ``(len(indices), num_classes)``.
 
     Raises:
-        ValueError: If any value in ``df.loc[indices, "label"]`` is unseen
-            by ``label_encoder`` (not present in ``class_mapping.json``).
-
-    Dependencies:
-        numpy, tensorflow.keras.utils.to_categorical.
+        ValueError: If any label in the subset is unseen by ``label_encoder``.
     """
     # The reshape itself lives in prepare_model_features, so the labelled and
     # unlabelled paths cannot drift apart.
@@ -598,26 +465,9 @@ def prepare_model_ready_data(
 def run_preprocessing_pipeline(config: dict) -> None:
     """Run the full 11-step preprocessing pipeline and persist all artifacts.
 
-    Purpose:
-        Top-level orchestrator that executes steps 1–11 in the exact fixed
-        order specified in SDS Section 14.2.  Respects
-        ``config["dataset"]["force_reprocess"]``: if ``False`` and the
-        processed CSV already exists, logs an INFO message and returns
-        immediately without regeneration.
-
-    Execution order:
-        1.  load_raw_dataset
-        2.  drop_identifier_columns
-        3.  create_labels  (sole native-column removal point)
-        3b. drop_duplicates  (BEFORE the split — see below)
-        4.  split_train_test  (on the unencoded, unscaled labeled DataFrame)
-        5.  infer_feature_column_types  (on df.loc[train_indices] only)
-        6.  fit categorical encoder(s)  (on df.loc[train_indices] only)
-        7.  Apply categorical encoder(s) to the full dataset
-        8.  Fit MinMaxScaler on train rows, apply to full dataset
-        9.  fit_label_encoder  (on df.loc[train_indices, "label"] only)
-        10. Persist the processed dataset (Parquet or CSV, per config)
-        11. Persist all artifacts to outputs/artifacts/
+    Executes steps 1-11 in the fixed order of SDS Section 14.2. Respects
+    ``config["dataset"]["force_reprocess"]``: when ``False`` and the processed
+    file already exists, it logs and returns without regenerating.
 
     Two deliberate deviations from the original SDS §14.2 ordering, both of
     which close leakage paths rather than introduce them:
@@ -632,20 +482,12 @@ def run_preprocessing_pipeline(config: dict) -> None:
         how a column was classified and encoded. Every fitted decision in the
         pipeline now sees training rows exclusively.
 
-
     Args:
         config: Fully loaded config dict from ``load_config()``.
-
-    Returns:
-        None
 
     Raises:
         Propagates any exception raised by the functions it calls, after
         logging the full stack trace at ERROR level.
-
-    Dependencies:
-        All functions in this file, src.preprocessing.load_dataset,
-        src.utils.logger, src.utils.seed, pickle, json.
     """
     logs_dir = config["paths"]["logs_dir"]
     logger = get_logger("preprocessing", logs_dir)

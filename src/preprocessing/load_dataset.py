@@ -1,15 +1,8 @@
 """Raw dataset loading, column dropping, and label derivation for the IIoT project.
 
-This module owns the first three steps of the preprocessing pipeline:
-  1. load_raw_dataset   — read the Edge-IIoTset CSV into a DataFrame.
-  2. drop_identifier_columns — remove high-cardinality / identifier columns.
-  3. create_labels      — derive ``label`` and ``binary_label`` and drop the
-                          native source columns (Attack_type, Attack_label).
-
-Ownership rule (SDS Section 14.1):
-  create_labels is the sole, authoritative owner of native-column removal
-  (Attack_type, Attack_label) throughout the entire codebase. No other
-  function, in any phase, may drop either column.
+Ownership rule (SDS Section 14.1): ``create_labels`` is the sole, authoritative
+owner of native-column removal (Attack_type, Attack_label) throughout the entire
+codebase. No other function, in any phase, may drop either column.
 """
 
 import logging
@@ -22,45 +15,32 @@ import pandas as pd
 def load_raw_dataset(raw_path: str) -> pd.DataFrame:
     """Read the raw Edge-IIoTset CSV file into a pandas DataFrame.
 
-    Purpose:
-        Open the CSV at ``raw_path`` and return its contents as a DataFrame.
-        No column transformations are performed here — the caller is
-        responsible for passing an already-assembled path built via
-        ``os.path.join(config["paths"]["raw_data_dir"],
-        config["paths"]["raw_data_file"])``.
+    No column transformations happen here; the caller passes an
+    already-assembled path.
 
     Args:
-        raw_path: Absolute or relative path to the raw CSV file
-            (``data/raw/edge_iiotset.csv`` by default).
+        raw_path: Path to the raw CSV (``data/raw/edge_iiotset.csv`` by
+            default).
 
     Returns:
         pd.DataFrame: The fully-loaded raw dataset.
 
     Raises:
         FileNotFoundError: If ``raw_path`` does not exist on disk.
-
-    Dependencies:
-        pandas, src.utils.logger (logger is passed by the calling script;
-        this function does not construct its own logger).
     """
     if not os.path.exists(raw_path):
         raise FileNotFoundError(
             f"Raw dataset not found at: '{raw_path}'"
         )
 
-    # Post-load numeric downcasting halves peak RAM relative to the pandas
-    # float64/int64 defaults. The raw CSV is ~1.16 GB on disk and inflates to
-    # roughly 3-4 GB as a default-dtype frame; float32/int32 brings that to
-    # ~1.5-2 GB. No precision is lost that matters here — these columns are
-    # packet counts, byte lengths, port numbers, and flow statistics, none of
-    # which carry more than 7 significant digits, and every value is
-    # subsequently MinMax-scaled into [0, 1] and fed to a float32 Keras graph.
     df = pd.read_csv(raw_path, low_memory=False)
 
-
-    # Downcast numeric columns from float64/int64 to float32/int32 in place.
-    # Object columns (the handful of nominal string columns) are left untouched;
-    # they will be handled by fit_categorical_transformer later.
+    # Downcasting halves peak RAM: the raw CSV inflates to ~3-4 GB as a
+    # default-dtype frame versus ~1.5-2 GB at float32/int32. No meaningful
+    # precision is lost — these are packet counts, byte lengths, ports, and
+    # flow statistics under 7 significant digits, all subsequently MinMax-scaled
+    # into [0, 1] for a float32 Keras graph. Object columns are left for
+    # fit_categorical_transformer.
     float64_cols = df.select_dtypes("float64").columns
     if len(float64_cols):
         df[float64_cols] = df[float64_cols].astype("float32")
@@ -79,27 +59,18 @@ def drop_identifier_columns(
 ) -> pd.DataFrame:
     """Remove identifier and high-cardinality columns from the DataFrame.
 
-    Purpose:
-        Drop every column named in ``columns_to_drop`` from ``df``.
-        Columns absent from ``df`` are silently ignored (``errors="ignore"``).
-        This function NEVER drops ``Attack_type`` or ``Attack_label`` — those
-        native label-source columns are reserved exclusively for
-        ``create_labels`` (SDS Section 14.1, Contract Invariant A.2).
+    Never drops ``Attack_type`` or ``Attack_label`` — those native label-source
+    columns are reserved exclusively for ``create_labels`` (SDS Section 14.1,
+    Contract Invariant A.2). Absent columns are ignored.
 
     Args:
         df: Input DataFrame (the raw loaded dataset).
-        columns_to_drop: List of column names to drop, sourced from
+        columns_to_drop: Column names to drop, from
             ``config["dataset"]["drop_columns"]``.
 
     Returns:
-        pd.DataFrame: New DataFrame with the specified columns removed;
-            the original ``df`` is not mutated in place.
-
-    Raises:
-        Nothing. Missing columns are silently ignored via ``errors="ignore"``.
-
-    Dependencies:
-        pandas.
+        pd.DataFrame: New DataFrame with the columns removed; ``df`` is not
+            mutated in place.
     """
     return df.drop(columns=columns_to_drop, errors="ignore")
 
@@ -113,54 +84,31 @@ def create_labels(
 ) -> pd.DataFrame:
     """Derive label columns and remove native source columns from the DataFrame.
 
-    Purpose:
-        This is the **sole, authoritative** function that:
-          1. Creates ``label`` — an exact copy of ``df[target_column]`` (the
-             multi-class string label, e.g. ``"Normal"``, ``"DDoS_HTTP"``, ...).
-          2. Creates ``binary_label`` — derived independently from
-             ``target_column``:  0 where ``df[target_column] ==
-             normal_class_value`` (exact, case-sensitive), else 1.
-          3. Validates agreement between the derived ``binary_label`` and the
-             existing ``raw_binary_column``. If any row disagrees, a WARNING
-             is logged (not raised) and the target-derived value is kept.
-          4. Drops both ``target_column`` (Attack_type) and
-             ``raw_binary_column`` (Attack_label) from the returned DataFrame,
-             so they cannot leak into model features downstream.
+    The sole, authoritative function that derives ``label`` / ``binary_label``
+    and drops the two native source columns, so they cannot leak into model
+    features downstream. No other function in the codebase may do either.
 
-        No other function in the entire codebase may drop either native
-        column, derive ``label``, or derive ``binary_label``.
+    ``binary_label`` is derived from ``target_column``, not copied from
+    ``raw_binary_column``; the two are then cross-checked and any disagreement
+    is logged as a WARNING with the target-derived value kept as authoritative.
 
     Args:
-        df: DataFrame that must still contain both ``target_column`` and
-            ``raw_binary_column`` (called immediately after
-            ``drop_identifier_columns``, which never removes either).
-        target_column: Name of the multi-class native label column
-            (= ``config["dataset"]["target_column"]``, i.e. ``"Attack_type"``).
-        raw_binary_column: Name of the native binary label column
-            (= ``config["dataset"]["raw_binary_column"]``,
-            i.e. ``"Attack_label"``).
-        normal_class_value: String value in ``target_column`` that represents
-            normal (benign) traffic
-            (= ``config["dataset"]["normal_class_value"]``, i.e. ``"Normal"``).
-        logger: Optional pre-constructed ``logging.Logger`` instance passed
-            down from the calling ``experiments/run_*.py`` script.
-            If ``None``, a fallback module-level logger is used for the
-            WARNING path only.
+        df: DataFrame still containing both ``target_column`` and
+            ``raw_binary_column``.
+        target_column: Multi-class native label column (``"Attack_type"``).
+        raw_binary_column: Native binary label column (``"Attack_label"``).
+        normal_class_value: Value in ``target_column`` meaning benign traffic
+            (``"Normal"``), matched exactly and case-sensitively.
+        logger: Optional logger from the calling ``experiments/run_*.py``
+            script. Falls back to a module logger for the WARNING path only.
 
     Returns:
-        pd.DataFrame: New DataFrame with:
-            - ``label`` column added (multi-class string).
-            - ``binary_label`` column added (int: 0 = normal, 1 = attack).
-            - ``target_column`` and ``raw_binary_column`` both dropped.
+        pd.DataFrame: New DataFrame with ``label`` (string) and ``binary_label``
+            (0 = normal, 1 = attack) added, and both native columns dropped.
 
     Raises:
-        KeyError: If ``target_column`` or ``raw_binary_column`` is not present
-            in ``df``.
-
-    Dependencies:
-        pandas, numpy, src.utils.logger.
+        KeyError: If either native column is missing from ``df``.
     """
-    # Validate that required source columns are present
     if target_column not in df.columns:
         raise KeyError(
             f"target_column '{target_column}' not found in DataFrame columns."
@@ -174,15 +122,12 @@ def create_labels(
 
     df = df.copy()
 
-    # Step 1: derive label (exact copy of target_column)
     df["label"] = df[target_column].values
 
-    # Step 2: derive binary_label from target_column (not from raw_binary_column)
     df["binary_label"] = np.where(
         df[target_column] == normal_class_value, 0, 1
     )
 
-    # Step 3: validate agreement with raw_binary_column
     agreement_mask = df["binary_label"] == df[raw_binary_column].astype(int)
     mismatch_count = (~agreement_mask).sum()
     if mismatch_count > 0:
@@ -194,7 +139,7 @@ def create_labels(
             raw_binary_column,
         )
 
-    # Step 4: drop both native source columns (sole removal point in pipeline)
+    # Sole native-column removal point in the entire pipeline.
     df = df.drop(columns=[target_column, raw_binary_column])
 
     return df

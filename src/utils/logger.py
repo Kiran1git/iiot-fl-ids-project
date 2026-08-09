@@ -21,12 +21,9 @@ from datetime import datetime
 def get_logger(name: str, logs_dir: str) -> logging.Logger:
     """Create and return a configured Logger writing to console and a log file.
 
-    Purpose:
-        Construct a logging.Logger that emits INFO-level messages to the
-        console (stdout) and DEBUG-level messages to a new, uniquely
-        timestamped file under logs_dir. Each call produces exactly one new
-        log file; files are never overwritten — every run appends a fresh
-        timestamped file to preserve full run history.
+    Emits INFO-level messages to the console and DEBUG-level messages to a
+    uniquely timestamped file under ``logs_dir``. Each call produces exactly one
+    new log file; files are never overwritten, preserving full run history.
 
     Args:
         name: Fixed literal identifier for the calling script. Must be one of
