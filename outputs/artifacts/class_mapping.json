@@ -1,0 +1,17 @@
+{
+  "0": "Backdoor",
+  "1": "DDoS_HTTP",
+  "2": "DDoS_ICMP",
+  "3": "DDoS_TCP",
+  "4": "DDoS_UDP",
+  "5": "Fingerprinting",
+  "6": "MITM",
+  "7": "Normal",
+  "8": "Password",
+  "9": "Port_Scanning",
+  "10": "Ransomware",
+  "11": "SQL_injection",
+  "12": "Uploading",
+  "13": "Vulnerability_scanner",
+  "14": "XSS"
+}
